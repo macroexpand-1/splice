@@ -14,7 +14,8 @@ rational minor units, and the session driver that runs it under canary."
                              (:file "app")
                              (:file "flagship")
                              (:file "session")
-                             (:file "cluster-spec")))))
+                             (:file "cluster-spec"))))
+  :in-order-to ((test-op (test-op "splice-orders/tests" "splice-orders/criteria"))))
 
 (defsystem "splice-orders/cluster"
   :description "The order workload as a TCP cluster member's host"
@@ -32,6 +33,20 @@ artifacts/criteria-report.md with the measured numbers."
                     (declare (ignore o c))
                     (unless (uiop:symbol-call :splice-orders/criteria :run-criteria)
                       (error "splice criteria failed; see artifacts/criteria-report.md"))))
+
+(defsystem "splice-orders/tests"
+  :description "The example's tests: the observer hooks the demo uses."
+  :depends-on ("splice-orders" "fiveam")
+  :serial t
+  :components ((:module "test"
+                :components ((:file "package")
+                             (:file "hooks"))))
+  :perform (test-op (o c)
+                    (declare (ignore o c))
+                    (unless (uiop:symbol-call :fiveam :run!
+                                              (uiop:find-symbol* :splice-orders-tests
+                                                                 :splice-orders/tests))
+                      (error "splice-orders tests failed"))))
 
 (defsystem "splice-orders/demo-probe"
   :description "Layout probe, only needs splice-orders and fiveam.
@@ -68,7 +83,12 @@ presenter gate, recording and the act driver. Everything testable without a brow
   :serial t
   :components ((:module "test/demo"
                 :components ((:file "package")
-                             (:file "snapshot"))))
+                             (:file "snapshot")
+                             (:file "sampler")
+                             (:file "render")
+                             (:file "gate")
+                             (:file "record")
+                             (:file "driver"))))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (unless (uiop:symbol-call :fiveam :run!

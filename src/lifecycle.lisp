@@ -128,8 +128,9 @@ transition. Returns the action taken: :continue when nothing changed, else
              (sprt-set-p0 (patch-set-sprt-error ps) (max rate 1d-3)))
            ;; a degraded control arm makes any canary verdict meaningless
            (when (> rate (patch-set-confound-threshold ps))
-             (freeze-locked ps (list :confounded :control-rate rate))
-             (return-from report-outcome-locked :frozen))))
+             (return-from report-outcome-locked
+               (settle-locked ps :confounded :freeze
+                              (list :confounded :control-rate rate))))))
        :continue)
       (t                              ; :new, a canary observation
        (evaluate-canary-observation ps failure-p latency-ms)))))
@@ -155,7 +156,8 @@ transition. Returns the action taken: :continue when nothing changed, else
       (let ((failing (run-contracts ps :phase :runtime)))
         (when (and failing (not (eq failing t)))
           (return-from evaluate-canary-observation
-            (initiate-rollback-locked ps (list :runtime-contract failing))))))
+            (settle-rollback-locked ps :runtime-contract
+                                    (list :runtime-contract failing))))))
     (cond
       ;; either stream rejecting is a rollback
       ((or (eq err-verdict :reject) (eq lat-verdict :reject))
@@ -164,23 +166,22 @@ transition. Returns the action taken: :continue when nothing changed, else
          (defer (lambda () (signal 'canary-verdict :patch-set ps :stream-kind stream
                                                    :direction :reject
                                                    :n (sprt-n sprt) :llr (sprt-llr sprt))))
-         (initiate-rollback-locked
-          ps (list :sprt-reject (sprt-snapshot sprt stream)))))
+         (settle-rollback-locked ps :sprt-reject
+                                 (list :sprt-reject (sprt-snapshot sprt stream)))))
       ;; stage advances only when both streams accept health
       ((and (eq err-verdict :accept) (eq lat-verdict :accept))
        (defer (lambda () (signal 'canary-verdict :patch-set ps :stream-kind :both
                                                  :direction :accept
                                                  :n (sprt-n err-sprt) :llr (sprt-llr err-sprt))))
        (if (< (1+ (patch-set-stage-index ps)) (length (patch-set-ramp ps)))
-           (progn (enter-stage ps (1+ (patch-set-stage-index ps)))
-                  :advanced)
-           (progn (begin-promotion-locked ps) :promoting)))
+           (settle-locked ps :sprt-accept :advance nil)
+           (settle-locked ps :sprt-accept :promote nil)))
       ;; stage budget spent without a verdict: freeze, never promote silently
       ((or (eq err-verdict :undecided) (eq lat-verdict :undecided))
-       (freeze-locked ps (list :stage-timeout
-                               :errors (sprt-snapshot err-sprt :errors)
-                               :latency (sprt-snapshot lat-sprt :latency)))
-       :frozen)
+       (settle-locked ps :stage-timeout :freeze
+                      (list :stage-timeout
+                            :errors (sprt-snapshot err-sprt :errors)
+                            :latency (sprt-snapshot lat-sprt :latency))))
       (t :continue))))
 
 (defun sprt-point (sprt)

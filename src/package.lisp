@@ -33,8 +33,9 @@
    ;; conditions & restarts
    #:splice-condition #:patch-vetoed #:canary-anomaly #:canary-verdict
    #:migration-failure #:rollback-initiated #:rollback-failure
-   #:illegal-transition
-   #:fallback-to-old #:force-promote #:abort-patch
+   #:illegal-transition #:operator-decision
+   #:fallback-to-old #:roll-back-patch #:freeze-patch #:promote-anyway
+   #:let-splice-decide #:with-operator-decisions
 
    ;; condition readers
    #:splice-condition-patch-set
@@ -45,6 +46,8 @@
    #:migration-failure-instance #:migration-failure-direction
    #:migration-failure-cause
    #:rollback-initiated-trigger #:rollback-failure-cause
+   #:operator-decision-point #:operator-decision-default
+   #:operator-decision-cause
 
    ;; utilities
    #:sha256-hex #:sha256-self-test))
