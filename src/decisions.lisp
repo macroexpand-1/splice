@@ -14,11 +14,10 @@
 (defvar *operator-decisions* nil
   "True where decision points ask the debugger. Only ever bound.")
 
-(defmacro with-operator-deicions (&body body)
+(defmacro with-operator-decisions (&body body)
   "Decision points reached on this thread ask the operator. Wrap the task loop."
   `(let ((*operator-decisions* t))
-     ,@body)
-  )
+     ,@body))
 
 ;;; ---------------------------------------------------------------------
 ;;; Settling a decision point. DEFAULT is what splice does there: :ROLL-BACK,
@@ -28,7 +27,7 @@
 (defun settle-locked (ps point default cause)
   "Do DEFAULT with CAUSE, or hold PS for an operator  (if one is watching)"
   (if *operator-decisions*
-      (hold-for-operator-locked ps point defualt cause)
+      (hold-for-operator-locked ps point default cause)
       (splice-default-locked ps default cause)))
 
 (defun rollback-default (ps trigger)
@@ -37,7 +36,7 @@
       (values :freeze (list :lossy-reversal-needs-human :trigger trigger))
       (values :roll-back trigger)))
 
-(defun settle-rollblack-locks (ps point trigger)
+(defun settle-rollback-locked (ps point trigger)
   "SETTLE-LOCKED for a decision point whose default is a rollback"
   (multiple-value-bind (default cause) (rollback-default ps trigger)
     (settle-locked ps point default cause)))
@@ -63,7 +62,7 @@
 ;;; ---------------------------------------------------------------------
 ;;; Holding a set while an operator decides
 
-(defun hold-for-operator-lock (ps point default cause)
+(defun hold-for-operator-locked (ps point default cause)
   "Freeze PS and ask the operator once the lock is released"
   (let* ((hold-reason (list :awaiting-operator :point point
                                                :default default :cause cause))
@@ -89,7 +88,7 @@
   (let ((ps (splice-condition-patch-set decision)))
     (assert (not (sb-thread:holding-mutex-p (patch-set-lock ps))) ()
             "~a's lock is held while asking an operator" (patch-set-name ps))
-    (if (with-set-lock (ps) (still-held-p decision))
+    (if (with-set-lock (ps) (still-held-p ps decision))
         (apply-decision decision (choose decision))
         :abandoned)))
 
@@ -100,19 +99,19 @@
                          (invoke-debugger decision))
       (roll-back-patch ()
         :report (lambda (stream)
-                  (format stream "Roll back ~a: restore the old code" name))
+                  (format stream "Roll back ~a: restore the old code." name))
         :roll-back)
       (freeze-patch ()
         :report (lambda (stream)
-                  (format stream "Keep ~a frozen; new tasks run old code" name))
+                  (format stream "Keep ~a frozen; new tasks run old code." name))
         :freeze)
       (promote-anyway ()
         :report (lambda (stream)
-                  (format stream "Promote ~a now, skipping the rest of the ramp" name))
+                  (format stream "Promote ~a now, skipping the rest of the ramp." name))
         :promote)
       (let-splice-decide ()
         :report (lambda (stream)
-                  (format stream "Let splice decide: ~a"
+                  (format stream "Let splice decide: ~a."
                           (default-description (operator-decision-default decision))))
         :splice-decides))))
 
@@ -120,7 +119,7 @@
   (ecase point
     (:sprt-reject "an SPRT reject")
     (:runtime-contract "a failing runtime contract")
-    (:sprt-accept "a SPRT accept")
+    (:sprt-accept "an SPRT accept")
     (:stage-timeout "a stage timeout")
     (:confounded "a confounded control arm")))
 
@@ -150,7 +149,7 @@
   "Invoke teh PROMOTE-ANYWAY restart"
   (invoke-decision-restart 'promote-anyway condition))
 
-(defun let-spice-decide (&optional condition)
+(defun let-splice-decide (&optional condition)
   "Invoke the LET-SPLICE-DECIDE restart"
   (invoke-decision-restart 'let-splice-decide condition))
 
@@ -163,4 +162,35 @@
     (with-set-lock (ps)
       (if (still-held-p ps decision)
           (decide-locked ps decision choice)
-          (abandon-decision-locked ps )))))
+          (abandon-decision-locked ps decision choice)))))
+
+(defun decide-locked (ps decision choice)
+  "Carry out CHOICE, audited with the thread that's choosing"
+  (let ((point (operator-decision-point decision))
+        (default (operator-decision-default decision))
+        (cause (operator-decision-cause decision))
+        (operator "debugger"))
+    (audit :operator-decision :patch-set (patch-set-name ps)
+                              :point point :choice choice :default default
+                              :thread (sb-thread:thread-name sb-thread:*current-thread*))
+    (ecase choice
+      (:roll-back
+       (initiate-rollback-locked ps (list :operator operator :point point)))
+      (:freeze
+       (refreeze-locked ps (list :operator operator :point point :reason cause))
+       :frozen)
+      (:promote
+       (audit :force-promote :patch-set (patch-set-name ps) :operator operator)
+       (begin-promotion-locked ps)
+       :promoting)
+      (:splice-decides
+       (splice-default-locked ps default cause)))))
+
+(defun abandon-decision-locked (ps decision choice)
+  "Audit a choice that came after somethign else moved PS"
+  (audit :decision-abandoned
+         :patch-set (patch-set-name ps)
+         :point (operator-decision-point decision)
+         :choice choice
+         :found (patch-set-state ps))
+  :abandoned)

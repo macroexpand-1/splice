@@ -1,6 +1,5 @@
 ;;;; protocol.lisp: the cluster protocol with no transport.
-;;;; just the spec hash, the pure conductor step, and one conductor
-;;;; and member wired together in this image
+;;;; just the spec hash and the pure conductor step
 
 (in-package #:splice-tests)
 
@@ -230,8 +229,9 @@ the new code always fails, so the error SPRT rejects at its floor of 5"
         (splice:unregister-patch-set 'protocol-probe-set)))))
 
 ;;; ---------------------------------------------------------------------
-;;; Conductor and member in one image
-;;; No socket.
+;;; Test wire
+;;; An in-image queue standing in for the transport. The live
+;;; conductor-and-member test in integration/cluster.lisp uses it too.
 
 (defstruct (test-wire (:constructor make-test-wire ()))
   (lock (sb-thread:make-mutex :name "test wire") :read-only t)
@@ -256,44 +256,3 @@ the new code always fails, so the error SPRT rejects at its floor of 5"
 
 (defmethod splice/cluster:send-to-conductor ((wire test-wire) message)
   (wire-post wire :conductor message))
-
-(defun drive-probe-task (cluster-member id)
-  "Run one task over PROTOCOL-PROBE while CLUSTER-MEMBER's set canaries
-sending its health every tenth task, otherwise wait a moment"
-  (let ((ps (splice/cluster::member-patch-set cluster-member)))
-    (if (and ps (splice::canary-stage-p (splice:patch-set-state ps)))
-        (progn
-          (splice:with-task (:id id :swallow-errors t)
-            (funcall 'protocol-probe id))
-          (when (zerop (mod id 10))
-            (splice/cluster:member-send-health cluster-member)))
-        (sleep 0.01))))
-
-(test one-member-runs-in-process
-  (let* ((wire (make-test-wire))
-         (conductor (splice/cluster:make-conductor :adapter wire))
-         (cluster-member (splice/cluster:make-member :adapter wire))
-         (deadline (+ (get-internal-real-time)
-                      (* 30 internal-time-units-per-second))))
-    (unwind-protect
-         (progn
-           (splice/cluster:conductor-add-member conductor :m1)
-           (splice/cluster:conductor-ship conductor (probe-spec))
-           (loop for id from 1
-                 until (or (member (splice/cluster:conductor-phase conductor)
-                                   '(:done :aborted))
-                           (> (get-internal-real-time) deadline))
-                 do (let ((next (wire-take wire)))
-                         (cond ((null next)
-                                (drive-probe-task cluster-member id))
-                               ((eq :member (car next))
-                                (splice/cluster:member-receive cluster-member (cdr next)))
-                               (t
-                                (splice/cluster:conductor-receive conductor :m1 (cdr next))))))
-           (is (eq :done (splice/cluster:conductor-phase conductor)))
-           (is (equal '((:member :m1 :state :rolled-back :reversal nil))
-                      (splice/cluster:conductor-finals conductor)))
-           (is (every #'wire-value-p (test-wire-seen wire))
-               "a message held something other than a wire value!"))
-      (let ((ps (splice:find-patch-set 'protocol-probe-set)))
-        (when ps (retire  ps))))))

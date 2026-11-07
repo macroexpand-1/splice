@@ -16,7 +16,8 @@ the reversible class migration, and the hash-chained log. Very specifically load
                              (:file "router")
                              (:file "migration")
                              (:file "patch")
-                             (:file "lifecycle"))))
+                             (:file "lifecycle")
+                             (:file "decisions"))))
   :in-order-to ((test-op (test-op "splice/tests"))))
 
 (defsystem "splice/cluster"
@@ -52,7 +53,8 @@ the member. No transport, so like splice it loads no SBCL contribs."
                              (:file "audit")
                              (:file "patch")
                              (:file "migration")
-                             (:file "lifecycle"))))
+                             (:file "lifecycle")
+                             (:file "decisions"))))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (unless (uiop:symbol-call :fiveam :run!
@@ -74,3 +76,22 @@ package and fixtures and runs *no* socket."
                                                        (uiop:find-symbol* suite :splice-tests)))
                                    '(:cluster-protocol))
                       (error "splice cluster tests failed"))))
+
+(defsystem "splice/integration-tests"
+  :description "Integration tests: live patch sets driven by real tasks, with
+rollback and promotion threads, and one conductor and member in this image.
+Slower than the unit suite, so (asdf:test-system \"splice\") leaves them out.
+Shares the unit suite's package and fixtures."
+  :depends-on ("splice/cluster-tests" "fiveam")
+  :serial t
+  :components ((:module "test/integration"
+                :components ((:file "fixtures")
+                             (:file "lifecycle")
+                             (:file "decisions")
+                             (:file "cluster"))))
+  :perform (test-op (o c)
+                    (declare (ignore o c))
+                    (unless (uiop:symbol-call :fiveam :run!
+                                              (uiop:find-symbol* :integration
+                                                                 :splice-tests))
+                      (error "splice integration tests failed"))))

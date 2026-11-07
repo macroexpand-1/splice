@@ -77,12 +77,12 @@
 
 ;; Entered into the debugger at the canary decision point on a thread
 ;; inside WITH-OPERATOR-DECISIONS. The set is frozen while it waits.
-;; The restarts on ROLL-BLACK-PATCH, FREEZE-PATCH, PROMOTE-ANYWAY and
+;; The restarts on ROLL-BACK-PATCH, FREEZE-PATCH, PROMOTE-ANYWAY and
 ;; LET-SPLICE-DECIDE settle it.
 (define-condition operator-decision (splice-condition)
   ((point :initarg :point :reader operator-decision-point)
    (default :initarg :default :reader operator-decision-default)
-   (cause :initarg :cause :reader operator-decision -cause)
+   (cause :initarg :cause :reader operator-decision-cause)
    (hold-reason :initarg :hold-reason :reader operator-decision-hold-reason))
   (:report (lambda (c stream)
              (format stream "~a is held at ~a; splice would ~a"
