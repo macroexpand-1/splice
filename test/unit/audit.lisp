@@ -104,11 +104,11 @@
   (with-audit-log (path)
     (three-entry-log)
     (with-tampered-copy
-        path
-        (lambda (lines)
-          (list (first lines)
-                (uiop:frob-substrings (second lines) '(":N 2") ":N 9")
-                (third lines)))
+      path
+      (lambda (lines)
+        (list (first lines)
+              (uiop:frob-substrings (second lines) '(":N 2") ":N 9")
+              (third lines)))
       (lambda (copy)
         (is (equal '(nil 2 3) (multiple-value-list (splice:verify-audit-chain copy))))))))
 
@@ -118,6 +118,87 @@
     (with-tampered-copy path (lambda (lines) (list (first lines) (third lines)))
       (lambda (copy)
         (is (equal '(nil 1 3) (multiple-value-list (splice:verify-audit-chain copy))))))))
+
+;;; ---------------------------------------------------------------------
+;;; Opening and resuming
+
+(test opening-an-existing-log-refuses-and-leaves-it-alone
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:close-audit-log)
+    (signals error (splice:open-audit-log path))
+    (is (= 1 (length (log-lines path))))))
+
+(test deleting-a-log-says-what-it-found
+  (with-temp-log-path (path)
+    (is (eq :absent (splice:delete-audit-log path)))
+    (splice:open-audit-log path)
+    (splice:close-audit-log)
+    (is (eq :deleted (splice:delete-audit-log path)))
+    (is (null (probe-file path)))))
+
+(test resuming-a-missing-log-starts-a-chain-with-a-boot
+  (with-temp-log-path (path)
+    (splice:resume-audit-log path)
+    (splice:close-audit-log)
+    (let ((entry (first (log-entries path))))
+      (is (eq :boot (getf entry :event)))
+      (is (= 1 (get entry :seq)))
+      (is (string= "genesis" (getf entry :prev-hash)))
+      (is (string= splice::*boot-id* (getf entry :full-boot-id))))))
+
+(test resuming-continues-the-chain
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:audit :probe :n 2)
+    (splice:close-audit-log)
+    (splice:resume-audit-log path)
+    (splice:audit :probe :n 3)
+    (splice:close-audit-log)
+    (let ((entries (log-entries path)))
+      (is (equal '(1 2 3 4) (mapcar (lambda (e) (getf e :seq)) entries)))
+      (is (eq :boot (getf (third entries) :event))))
+    (is-true (splice:verify-audit-chain path))))
+
+(test resuming-refuses-a-broken-chain
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:close-audit-log)
+    (with-open-file (out path :direction :output :if-existings :append)
+      (write-line "(:SEQ 2 :PREV-HASH \"forged\" :EVENT :PROBE" out))
+    (signals error (splice:resume-audit-log path))))
+
+;;; ---------------------------------------------------------------------
+;;; Closing under writers
+
+(test auditing-a-closed-log-returns-nil
+  (with-temp-log-path (path)
+    (let ((log (splice:open-audit-log path)))
+      (splice:close-audit-log)
+      (let ((splice:*audit-log* log))
+        (is (null (splice:audit :probe :n 1)))))))
+
+(defun audit-until-closed (log)
+  "Write 2000 entries to LOG from this thread. Count lands or (:ERROR text)"
+  (let ((splice*audit-log* log))
+    (handler-case (loop repeat 2000 count (splice:audit :probe :n 1))
+      (error (e) (list :error (princ-to-string e))))))
+
+(test closing-under-writers-loses-no-line-and-signals-nothing
+  (with-temp-log-path (path)
+    (let* ((log (splice:open-audit-log path))
+           (threads (loop repeat 4
+                          collect (sb-thread:make-thread
+                                   (lambda () (audit-until-closed log))))))
+      (sleep 0.005)
+      (splice:close-audit-log)
+      (let ((landed (mapcar #'sb-thread:join-thread threads)))
+        (is (every #'integerp landed))
+        (is (= (reduce #'+ landed) (length (log-line path))))
+        (is-true (splice:verify-audit-chain path))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Reconstruction: the pure fold

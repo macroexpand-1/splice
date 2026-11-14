@@ -32,6 +32,12 @@
 (defun root () (asdf:system-source-directory "splice-orders"))
 (defun scratch-file (name) (merge-pathnames name (uiop:temporary-directory)))
 
+(defun fresh-scratch-log (name)
+  "SCRATCH-FILE NAME with any log a previous run left deleted"
+  (let ((path (scratch-file name)))
+    (splice:delete-audit-log path)
+    path))
+
 (defun default-runs ()
   (let ((v (sb-ext:posix-getenv "SPLICE_RUNS")))
     (if v (parse-integer v) 100)))
