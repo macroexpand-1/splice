@@ -24,14 +24,27 @@
 ;;; Writing the log
 
 (defun open-audit-log (path)
-  (let ((stream (open path :direction :output :if-exists :supersede
+  "Start a new log at PATH. Refuses a path that already holds a file:
+RESUME-AUDIT-LOG continues one"
+  (when (probe-file path)
+    (error "audit log ~a already exists; resume-audit-log continues it" path))
+  (let ((stream (open path :direction :output :if-exists :error
                            :if-does-not-exist :create)))
     (setf *audit-log* (%make-audit-log :path path :stream stream))))
 
+(defun delete-audit-log (path)
+  "Delete the log at PATH, for a caller that means to start it again.
+Returns :DELETED or :ABSENT"
+  (cond ((probe-file path) (delete-file path) :deleted)
+        (t :absent)))
+
 (defun close-audit-log ()
-  (when *audit-log*
-    (close (audit-log-stream *audit-log*))
-    (setf *audit-log* nil)))
+  "Close the open log under its lock, so no entry is cut off mid-write"
+  (let ((log *audit-log*))
+    (when log
+      (sb-thread:with-mutex ((audit-log-lock log))
+        (close (audit-log-stream log)))
+      (setf *audit-log* nil))))
 
 (defun timestamp-string ()
   "UTC wall clock time in ms, ISO 8601 standard"
@@ -61,31 +74,36 @@ functions, and other unREADable objects become (:opaque <hash-of-printed>)."
                      (flatten-newlines (princ-to-string value))))
     (t (list :opaque (subseq (sha256-hex (princ-to-string value)) 0 16)))))
 
+(defun write-entry (log event fields)
+  "Appen done entry to LOG and return its seq. Caller holds LOG's lock"
+  (let* ((entry (list* :seq (incf (audit-log-seq log))
+                       :ts (timestamp-string)
+                       :prev-hash (audit-log-prev-hash log)
+                       :boot-id (subseq *boot-id* 0 12)
+                       :event event
+                       (mapcar #'sanitize-for-log fields)))
+         (line (with-standard-io-syntax
+                 (let ((*print-readably* nil) (*print-pretty* nil)
+                       (*package* (find-package :splice)))
+                   (prin1-to-string entry)))))
+    (write-line line (audit-log-stream log))
+    (finish-output (audit-log-stream log))
+    (push line (audit-log-lines log))
+    (when (> (incf (audit-log-lines-count log)) 6000)
+      ;; keep the newest 3000. don't let long batches grow the heap
+      (setf (cdr (nthcdr 2999 (audit-log-lines log))) nil
+            (audit-log-lines-count log) 3000))
+    (setf (audit-log-prev-hash log) (sha256-hex line))
+    (audit-log-seq log)))
+
 (defun audit (event &rest fields)
-  "Append an entry to the audit log. EVENT is a keyword; FIELDS a plist.
-Returns the entry's sequence number, or NIL when no log is open."
-  (when *audit-log*
-    (sb-thread:with-mutex ((audit-log-lock *audit-log*))
-      (let* ((log *audit-log*)
-             (entry (list* :seq (incf (audit-log-seq log))
-                           :ts (timestamp-string)
-                           :prev-hash (audit-log-prev-hash log)
-                           :boot-id (subseq *boot-id* 0 12)
-                           :event event
-                           (mapcar #'sanitize-for-log fields)))
-             (line (with-standard-io-syntax
-                     (let ((*print-readably* nil) (*print-pretty* nil)
-                           (*package* (find-package :splice)))
-                       (prin1-to-string entry)))))
-        (write-line line (audit-log-stream log))
-        (finish-output (audit-log-stream log))
-        (push line (audit-log-lines log))
-        (when (> (incf (audit-log-lines-count log)) 6000)
-          ;; keep the newest 3000; long batches must not grow the heap
-          (setf (cdr (nthcdr 2999 (audit-log-lines log))) nil
-                (audit-log-lines-count log) 3000))
-        (setf (audit-log-prev-hash log) (sha256-hex line))
-        (audit-log-seq log)))))
+  "Append an entry to the audit log. EVENT is a keyword and FIELDS a plist.
+Returns the entry's sequence number or NIL"
+  (let ((log *audit-log*))
+    (when log
+      (sb-thread:with-mutex ((audit-log-lock log))
+        (when (open-stream-p (audit-log-stream log))
+          (write-entry log event fields))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Offline: chain verification
@@ -115,6 +133,56 @@ memory."
   "Verify the hash chain of the log at PATH. Returns (values ok entry-count
 break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
   (map-audit-entries path nil))
+
+(defun last-line (path)
+  "Last line of the file at PATH or :EMPTY"
+  (with-open-file (in path)
+    (loop with last = :empty
+          for line = (read-line in nil nil)
+          while line
+          do (setf last line)
+          finally (return last))))
+
+(defun entry-of-line (line)
+  "The audit entry one log LINE holds, read the way that MAP-AUDIT-ENTRIES reads."
+  (let ((*read-eval* nil)
+        (*package* (find-package :splice)))
+    (read-from-string line)))
+
+(defun chain-tail (path)
+  "Where the chain at PATH left off: last seq and the hash of the last line"
+  (let ((line (if (probe-file path) (last-line path) :empty)))
+    (if (eq line :empty)
+        (values 0 "genesis")
+        (values (getf (entry-of-line line) :seq) (sha256-hex line)))))
+
+(defun check-chain-intact (path)
+  "Signal an error when the log at PATH has a broken chain. Return :INTACT"
+  (multiple-value-bind (ok count break-seq) (verify-audit-chain path)
+    (declare (ignore count))
+    (unless ok
+      (error "audit chain broken at seq ~a; refusing to append" break-seq))
+    :intact))
+
+(defun boot-fields ()
+  "What a :BOOT entry records about this process"
+  (list :full-boot-id *boot-id*
+        :lisp (lisp-implementation-version)
+        :machine (machine-instance)
+        :core (namestring sb-ext:*core-pathname*)))
+
+(defun resume-audit-log (path)
+  "Append to the log at PATH, continuing the chaing, and record this boot"
+  (when (probe-file path)
+    (check-chain-intact path))
+  (multiple-value-bind (seq prev-hash) (chain-tail path)
+    (setf *audit-log*
+          (%make-audit-log :path path :seq seq :prev-hash prev-hash
+                           :stream (open path :direction :output
+                                              :if-exists :append
+                                              :if-does-not-exist :create))))
+  (apply #'audit :boot (boot-fields))
+  *audit-log*)
 
 ;;; ---------------------------------------------------------------------
 ;;; Offline: state reconstruction

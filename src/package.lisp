@@ -52,3 +52,4 @@
    ;; utilities
    #:sha256-hex #:sha256-self-test))
 
+   #:resume-audit-log #:delete-audit-log
