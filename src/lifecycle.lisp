@@ -26,14 +26,18 @@ This is off by default, a long criteria would log every observation")
 (defun patch-set-lifecycle-history (ps)
   (reverse (patch-set-history ps)))
 
+(defun baseline-failure-rate (ps)
+  "The control arm's failure rate, or a 0.001 prior until the arm has enough
+samples"
+  (let ((rate (control-failure-rate (patch-set-control-ring ps))))
+    (if (eq rate :too-few-samples) 0.001d0 rate)))
+
 (defun fresh-stage-sprts (ps)
   "New SPRT pair for a stage. Errors track the control arm's rate; latency
 tests exceedance of the control p95, so its p0 is fixed at 0.05."
   (setf (patch-set-sprt-error ps)
         (make-sprt :alpha (patch-set-alpha ps) :beta (patch-set-beta ps)
-                   :p0 (or (and (patch-set-control-ring ps)
-                                (control-failure-rate (patch-set-control-ring ps)))
-                           0.001d0)
+                   :p0 (baseline-failure-rate ps)
                    :min-n (patch-set-sprt-min-n ps)
                    :max-n (patch-set-sprt-max-n ps))
         (patch-set-sprt-latency ps)
@@ -49,8 +53,7 @@ tests exceedance of the control p95, so its p0 is fixed at 0.05."
 (defun install (name-or-ps)
   "Take a REGISTERED patch set through contracts into its first canary
 stage. Signals PATCH-VETOED, installing nothing, if any contract fails."
-  (let ((ps (if (patch-set-p name-or-ps) name-or-ps
-                (find-patch-set name-or-ps))))
+  (let ((ps (resolve-patch-set name-or-ps)))
     (assert (eq (patch-set-state ps) :registered) ()
             "~a is ~a, not :registered" (patch-set-name ps)
             (patch-set-state ps))
@@ -115,25 +118,27 @@ transition. Returns the action taken: :continue when nothing changed, else
     ;; hard triggers fire on any route: a migration failure can surface in
     ;; an old-routed task, and at 5% the next canary task may be far off
     (let ((trigger (take-hard-trigger ps)))
-      (when trigger
+      (unless (eq trigger :unarmed)
         (return-from report-outcome-locked
           (initiate-rollback-locked ps (cons :hard-trigger trigger)))))
     (cond
       ((eq route :old)
        (control-record ring failure-p latency-ms)
-       ;; refresh H0 from the live control arm
        (let ((rate (control-failure-rate ring)))
-         (when rate
-           (unless (sprt-fixed-p0 (patch-set-sprt-error ps))
-             (sprt-set-p0 (patch-set-sprt-error ps) (max rate 1d-3)))
-           ;; a degraded control arm makes any canary verdict meaningless
-           (when (> rate (patch-set-confound-threshold ps))
-             (return-from report-outcome-locked
-               (settle-locked ps :confounded :freeze
-                              (list :confounded :control-rate rate))))))
-       :continue)
+         (if (eq rate :too-few-samples)
+             :continue
+             (fold-control-rate ps rate))))
       (t                              ; :new, a canary observation
        (evaluate-canary-observation ps failure-p latency-ms)))))
+
+(defun fold-control-rate (ps rate)
+  "Refresh H0 from the live control arm's RATE, and freeze PS when the arm is
+too degraded for any canary verdict to mean something. Caller holds the lock"
+  (unless (sprt-fixed-p0 (patch-set-sprt-error ps))
+    (sprt-set-p0 (patch-set-sprt-error ps) (max rate 1d-3)))
+  (if (> rate (patch-set-confound-threshold ps))
+      (settle-locked ps :confounded :freeze (list :confounded :control-rate rate))
+      :continue))
 
 (defun evaluate-canary-observation (ps failure-p latency-ms)
   "Caller holds the lock; hard triggers were already checked upstream."
@@ -143,18 +148,18 @@ transition. Returns the action taken: :continue when nothing changed, else
          (p95 (control-latency-quantile ring 0.95))
          (err-verdict (sprt-observe err-sprt failure-p))
          ;; slow means above max(1.5*p95, p95+0.5ms)
-         (lat-verdict (if p95
+         (lat-verdict (if (eq p95 :too-few-samples)
+                          :continue
                           (sprt-observe lat-sprt
                                         (> latency-ms
-                                           (max (* 1.5 p95) (+ p95 0.5))))
-                          :continue)))
+                                           (max (* 1.5 p95) (+ p95 0.5)))))))
     (audit-sprt-step ps err-sprt lat-sprt)
     ;; sample runtime contracts: structural breakage is not a rate question
     (when (and (plusp (patch-set-runtime-contract-interval ps))
                (zerop (mod (sprt-n err-sprt)
                            (patch-set-runtime-contract-interval ps))))
-      (let ((failing (run-contracts ps :phase :runtime)))
-        (when (and failing (not (eq failing t)))
+      (multiple-value-bind (verdict failing) (run-contracts ps :phase :runtime)
+        (when (eq verdict :fail)
           (return-from evaluate-canary-observation
             (settle-rollback-locked ps :runtime-contract
                                     (list :runtime-contract failing))))))
@@ -356,9 +361,6 @@ operator cannot move the set out of."
   (transition ps :frozen :reason reason)
   (audit :freeze :patch-set (patch-set-name ps) :reason reason))
 
-(defun resolve-patch-set (name-or-ps)
-  (if (patch-set-p name-or-ps) name-or-ps (find-patch-set name-or-ps)))
-
 (defun refuse-locked (ps requested)
   "Signal ILLEGAL-TRANSITION once the lock is released, so its handlers run
 outside it. Returns :refused, which the caller never sees."
@@ -450,84 +452,92 @@ longer offered."
         (t (refuse-locked ps :seal))))
 
 (defun reverse-migration-report (name)
-  "The reversal counts recorded by the last completed rollback of NAME."
-  (let ((ps (resolve-patch-set name)))
-    (and ps (patch-set-last-reversal-report ps))))
+  "The reversal counts recorded by the last completed rollback of NAME or
+:NOT-ROLLED-BACK"
+  (patch-set-last-reversal-report (resolve-patch-set name)))
 
 (defun unregister-patch-set (name)
   (remhash name *patch-sets*))
 
 (defun wait-for-state (name-or-ps states &key (timeout 30))
-  "Block until the set reaches one of STATES. Returns it, or NIL on timeout."
-  (let ((ps (if (patch-set-p name-or-ps) name-or-ps
-                (find-patch-set name-or-ps)))
+  "Block until the set reaches one of STATES and return it or :TIMEOUT"
+  (let ((ps (resolve-patch-set name-or-ps))
         (deadline (+ (get-internal-real-time)
                      (* timeout internal-time-units-per-second))))
     (loop
       (let ((state (patch-set-state ps)))
         (when (member state states) (return state))
-        (when (> (get-internal-real-time) deadline) (return nil))
+        (when (> (get-internal-real-time) deadline) (return :timeout))
         (sleep 0.01)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Audit-log reconstruction vs. the live image
 
-(defun expected-function-object (name impl)
-  "The function object the log says should be installed at NAME."
-  (let ((owner nil) (fp nil))
-    (maphash (lambda (sname ps)
-               (declare (ignore sname))
-               (let ((hit (find name (patch-set-fn-patches ps)
-                                :key #'fn-patch-name)))
-                 (when hit (setf owner ps fp hit))))
-             *patch-sets*)
-    (when fp
-      (values (cond ((eq impl :original) (fn-patch-old-fn fp))
-                    ((eq impl :shimmed) (fn-patch-shim fp))
-                    ((and (consp impl) (eq (car impl) :new))
-                     (fn-patch-new-fn fp)))
-              owner))))
+;;; An impl or shape from RECONSTRUCT-STATE is (kind set-name). Every lookup
+;;; below takes the whole impl or shape, so it searches only the set named.
+
+(defun find-fn-patch (name impl)
+  "The fn-patch for NAME in the set IMPL names or :UNPATCHED"
+  (let ((ps (find-patch-set (second impl))))
+    (or (and ps (find name (patch-set-fn-patches ps) :key #'fn-patch-name))
+        :unpatched)))
+
+(defun find-class-patch (class-name shape)
+  "The class-patch for CLASS-NAME in the set SHAPE names or :UNPATCHED"
+  (let ((ps (find-patch-set (second shape))))
+    (or (and ps (find class-name (patch-set-class-patches ps)
+                      :key #'class-patch-class-name))
+        :unpatched)))
+
+(defun impl-function (fp impl)
+  "The function object IMPL's kind names for FP"
+  (ecase (first impl)
+    (:original (fn-patch-old-fn fp))
+    (:shimmed (fn-patch-shim fp))
+    (:new (fn-patch-new-fn fp))))
+
+(defun shape-slot-names (cp shape)
+  "Slot names CP's class has in SHAPE's kind"
+  (mapcar (lambda (spec) (getf spec :name))
+          (ecase (first shape)
+            (:original (class-patch-old-slot-specs cp))
+            (:union (class-patch-union-slots cp))
+            (:new (class-patch-final-slots cp)))))
+
+(defun live-slot-names (class-name)
+  "Direct slot names of the live class CLASS-NAME or :NO-CLASS"
+  (let ((class (find-class class-name nil)))
+    (cond ((null class) :no-class)
+          (t (sb-mop:finalize-inheritance class)
+             (mapcar #'sb-mop:slot-definition-name
+                     (sb-mop:class-direct-slots class))))))
+
+(defun function-mismatch (name impl)
+  "How the live function NAME differs from IMPL or :MATCH"
+  (let ((fp (find-fn-patch name impl)))
+    (cond ((eq fp :unpatched) (list name :no-registry-object impl))
+          ((eq (fdefinition name) (impl-function fp impl)) :match)
+          (t (list name :fdefinition-mismatch impl)))))
+
+(defun class-mismatch (class-name shape)
+  "How the live class CLASS-NAME differs from SHAPE or :MATCH"
+  (let ((cp (find-class-patch class-name shape))
+        (live (live-slot-names class-name)))
+    (cond ((eq cp :unpatched) (list class-name :no-registry-object shape))
+          ((and (listp live)
+                (null (set-exclusive-or (shape-slot-names cp shape) live)))
+           :match)
+          (t (list class-name :class-shape-mismatch shape
+                   :expected (shape-slot-names cp shape) :live live)))))
 
 (defun verify-reconstruction (path)
   "Reconstruct expected image state from the audit log at PATH and compare
 against the live image. Returns (values ok mismatches state)."
   (let* ((state (reconstruct-state path))
-         (mismatches '()))
-    (loop for (name . impl) in (getf state :functions)
-          do (multiple-value-bind (expected owner)
-                 (expected-function-object name impl)
-               (declare (ignore owner))
-               (cond ((null expected)
-                      (push (list name :no-registry-object impl) mismatches))
-                     ((not (eq (fdefinition name) expected))
-                      (push (list name :fdefinition-mismatch impl)
-                            mismatches)))))
-    (loop for (cname . shape) in (getf state :classes)
-          for class = (find-class cname nil)
-          do (let* ((cp (block find-cp
-                          (maphash (lambda (k ps)
-                                     (declare (ignore k))
-                                     (let ((hit (find cname
-                                                      (patch-set-class-patches ps)
-                                                      :key #'class-patch-class-name)))
-                                       (when hit (return-from find-cp hit))))
-                                   *patch-sets*)
-                          nil))
-                    (expected-names
-                      (when cp
-                        (mapcar (lambda (s) (getf s :name))
-                                (ecase shape
-                                  (:original (class-patch-old-slot-specs cp))
-                                  (:union (class-patch-union-slots cp))
-                                  (:new (class-patch-final-slots cp))))))
-                    (live-names
-                      (when class
-                        (sb-mop:finalize-inheritance class)
-                        (mapcar #'sb-mop:slot-definition-name
-                                (sb-mop:class-direct-slots class)))))
-               (unless (and expected-names
-                            (null (set-exclusive-or expected-names live-names)))
-                 (push (list cname :class-shape-mismatch shape
-                                   :expected expected-names :live live-names)
-                       mismatches))))
+         (mismatches
+           (remove :match
+                   (append (loop for (name . impl) in (getf state :functions)
+                                 collect (function-mismatch name impl))
+                           (loop for (cname . shape) in (getf state :classes)
+                                 collect (class-mismatch cname shape))))))
     (values (null mismatches) mismatches state)))

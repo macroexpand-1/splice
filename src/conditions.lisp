@@ -71,6 +71,13 @@
                      (name-of (splice-condition-patch-set c))
                      (illegal-transition-from c)))))
 
+;; Signaled when an operator names a patch set nothing registered.
+(define-condition unknown-patch-set (error)
+  ((name :initarg :name :reader unknown-patch-set-name))
+  (:report (lambda (c stream)
+             (format stream "No patch set named ~a is registered"
+                     (unknown-patch-set-name c)))))
+
 ;; NAME-OF tolerates conditions built before the patch-set struct exists.
 (defun name-of (patch-set-or-nil)
   (if patch-set-or-nil (patch-set-name patch-set-or-nil) "<none>"))

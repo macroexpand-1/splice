@@ -4,7 +4,7 @@
 
 (in-package #:splice)
 
-(defvar *task-id* nil "Identity of the current task, NIL outside task scope.")
+(defvar *task-id* nil "Identity of the current task or NIL.")
 (defvar *task-epochs* nil
   "List of (patch-set route) pins made at task entry.")
 (defvar *task-anomaly-noted* nil
@@ -54,8 +54,7 @@ Asked for Inline since every shim call asks it"
     (if pin (cadr pin) :old)))
 
 (defun current-route (set-name)
-  (let ((ps (find-patch-set set-name)))
-    (and ps (task-route-for ps))))
+  (task-route-for (resolve-patch-set set-name)))
 
 (defun note-anomaly (ps condition)
   "Record an error from :new-routed code, once per task per set. Storage

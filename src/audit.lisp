@@ -15,7 +15,7 @@
                       (get-internal-real-time) (machine-instance)))
   "Identity of this image incarnation, stamped into every log entry.")
 
-(defvar *audit-log* nil "The active audit log, or NIL for none.")
+(defvar *audit-log* nil "The active audit log or NIL.")
 
 (defconstant +unix-epoch-universal-time+ 2208988800
   "Universal epoch time (1970-01-01T00:00:00Z)")
@@ -98,50 +98,77 @@ functions, and other unREADable objects become (:opaque <hash-of-printed>)."
 
 (defun audit (event &rest fields)
   "Append an entry to the audit log. EVENT is a keyword and FIELDS a plist.
-Returns the entry's sequence number or NIL"
+Returns the entry's sequence number or :UNLOGGED"
   (let ((log *audit-log*))
-    (when log
-      (sb-thread:with-mutex ((audit-log-lock log))
-        (when (open-stream-p (audit-log-stream log))
-          (write-entry log event fields))))))
+    (if log
+        (sb-thread:with-mutex ((audit-log-lock log))
+          (if (open-stream-p (audit-log-stream log))
+              (write-entry log event fields)
+              :unlogged))
+        :unlogged)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Offline: chain verification
 
+(defun read-entry-or-readable (line)
+  "The entry LINE holds or :UNREADABLE"
+  (handler-case (let ((entry (entry-of-line line)))
+                  (if (and (consp entry) (integerp (getf entry :seq)))
+                      entry
+                      :unreadable))
+    (error () :unreadable)))
+
 (defun map-audit-entries (path fn &key (verify t))
   "Call FN on each entry of the log at PATH, verifying the hash chain.
-Returns (values ok count break-seq). Streams, so large logs never sit in
-memory."
-  (with-open-file (in path)
-    (let ((*read-eval* nil)
-          (*package* (find-package :splice))
-          (expected "genesis")
+Returns (values ok count break-seq reason). REASON is :INTACT, :HASH-MISMATCH,
+:UNREADABLE (a whole line that doesn't read) or :TORN-TAIL (a last line that
+doesn't read and has no newline, as a crash mid-write leaves). With VERIFY
+NIL, an unreadable line signals instead, so a reader that ignores OK never
+gets a short list. Streams, so large logs never sit in memory."
+  (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
+    (let ((expected "genesis")
           (count 0))
-      (loop for line = (read-line in nil nil)
+      (loop for (line missing-newline-p) = (multiple-value-list (read-line in nil nil))
             while line
-            do (let ((entry (read-from-string line)))
+            do (let ((entry (read-entry-or-unreadable line)))
+                 (when (eq entry :unreadable)
+                   (unless verify
+                     (error "audit log ~a has an unreadable line after entry ~a" path count))
+                   (return-from map-audit-entries
+                     (values nil count (1+ count)
+                             (if missing-newline-p :torn-tail :unreadable))))
                  (when (and verify
                             (not (equal (getf entry :prev-hash) expected)))
                    (return-from map-audit-entries
-                     (values nil count (getf entry :seq))))
+                     (values nil count (getf entry :seq) :hash-mismatch)))
                  (setf expected (sha256-hex line))
                  (incf count)
                  (when fn (funcall fn entry))))
-      (values t count nil))))
+      (values t count nil :intact))))
 
 (defun verify-audit-chain (path)
   "Verify the hash chain of the log at PATH. Returns (values ok entry-count
 break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
   (map-audit-entries path nil))
 
-(defun last-line (path)
-  "Last line of the file at PATH or :EMPTY"
-  (with-open-file (in path)
-    (loop with last = :empty
+(defun last-two-line (path)
+  "Last line of the file at PATH and the one before it. Eaach can be :EMPTY"
+  (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
+    (loop with previous = :empty
+          with last = :empty
           for line = (read-line in nil nil)
           while line
-          do (setf last line)
-          finally (return last))))
+          do (setf previous last
+                   last line)
+          finally (return (values last previous)))))
+
+(defun tail-line (path)
+  "The line the chain at PATH continues from. Last line that doesn't read is
+torn or still being written - chain continues."
+  (multiple-value-bind (last previous) (last-two-lines path)
+    (if (and (stringp last) (eq :unreadable (read-entry-or-unreadable last)))
+        previous
+        last)))
 
 (defun entry-of-line (line)
   "The audit entry one log LINE holds, read the way that MAP-AUDIT-ENTRIES reads."
@@ -150,7 +177,7 @@ break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
     (read-from-string line)))
 
 (defun chain-tail (path)
-  "Where the chain at PATH left off: last seq and the hash of the last line"
+  "Where the chain at PATH left off: last seq and the hash of the line it continues from"
   (let ((line (if (probe-file path) (last-line path) :empty)))
     (if (eq line :empty)
         (values 0 "genesis")
@@ -189,6 +216,8 @@ break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
 ;;; Reconstruction state is a plist of four alists, each newest first:
 ;;; :functions (name . impl), :classes (name . shape), :sets (name . state),
 ;;; and :members (set-name . (:functions fs :classes cs)) from registration.
+;;; An impl or shape is (kind set-name), naming the set whose code it is, so
+;;; a lookup can never land in a different set that patched the same name.
 ;;; Every function below returns a new state and leaves its argument alone.
 
 (defun empty-reconstruction ()
@@ -219,10 +248,12 @@ break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
 (defun patch-set-members (state set-name)
   (cdr (assoc set-name (getf state :members))))
 
-(defun retarget-set (state set-name set-state impl shape)
+(defun retarget-set (state set-name set-state impl-kind shape-kind)
   "STATE with SET-NAME moved to SET-STATE, each of its functions pointing at
-IMPL and each of its classes at SHAPE."
-  (let ((members (patch-set-members state set-name)))
+(IMPL-KIND SET-NAME) and each of its classes at (SHAPE-KIND SET-NAME)."
+  (let ((members (patch-set-members state set-name))
+        (impl (list impl-kind set-name))
+        (shape (list shape-kind set-name)))
     (update-field
      (update-field (update-set-state state set-name set-state)
                    :functions
@@ -255,7 +286,7 @@ state return STATE unchanged."
       (:canary-transition
        (update-set-state state set-name (getf entry :to)))
       (:promotion
-       (retarget-set state set-name :promoted (list :new set-name) :new))
+       (retarget-set state set-name :promoted :new :new))
       (:rollback-complete
        (retarget-set state set-name :rolled-back :original :original))
       (:freeze
@@ -265,8 +296,9 @@ state return STATE unchanged."
 (defun reconstruct-state (path)
   "Fold over the audit log to derive the image's expected code state.
 Returns a plist: (:functions alist(name . impl) :classes alist(name . shape)
-:sets alist(name . final-state)) where IMPL is :original, :shimmed, or
-(:new set-name), and SHAPE is :original, :union, or :new."
+:sets alist(name . final-state)) where IMPL is (:original set-name),
+(:shimmed set-name) or (:new set-name), and SHAPE is (:original set-name),
+(:union set-name) or (:new set-name)."
   (let ((state (empty-reconstruction)))
     ;; MAP-AUDIT-ENTRIES streams for effect, so the fold threads STATE here
     (multiple-value-bind (ok count break-seq)

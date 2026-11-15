@@ -9,6 +9,16 @@
   "Shim factories compiled once per arity. Skipping &REST/APPLY cuts canary
 call cost from ~2x to ~1.5x.")
 
+(defstruct (call-shape (:copier nil))
+  "Every call a lambda list accepts. TAIL is what may follow the positional
+arguments: :NONE, :REST (anything) or :KEYS (KEY-NAMES, or any keyword when
+OTHER-KEYS is :ALLOWED)."
+  (min 0 :read-only t)                  ; required arguments
+  (positional 0 :read-only t)           ; required plus optional
+  (tail :none :read-only t)
+  (key-names '() :read-only t)
+  (other-keys :rejected :read-only t))  ; :rejected or :allowed
+
 ;;; ---------------------------------------------------------------------
 ;;; DEFPATCH-SET declaration macro
 ;;; Each clause kind has a function that turns the clause into the form
@@ -89,19 +99,66 @@ A traced function answers with the function under the trace."
               (sb-kernel:%fun-lambda-list (sb-ext:unencapsulated-function function)))))
     (if (listp lambda-list) lambda-list :unknown)))
 
-(defun parse-arity (lambda-list)
-  "(values min-args max-args-or-nil). NIL max means &rest/&key.
-This is such a cool use of code as data."
-  (let ((min 0) (max 0) (unbounded nil) (state :required))
+(defun key-name (item)
+  "The keyword a &key ITEM is passed by: X, (X default) or ((:KW X) default)"
+  (let ((spec (if (consp item) (first item) item)))
+    (if (consp spec)
+        (first spec)
+        (intern (symbol-name spec) :keyword))))
+
+(defun parse-call-shape (lambda-list)
+  "LAMBDA-LIST's CALL-SHAPE. This is such a cool use of code as data."
+  (let ((min 0) (positional 0) (state :required)
+        (tail :none) (keys '()) (other-keys :rejected))
     (dolist (item lambda-list)
       (case item
         (&optional (setf state :optional))
-        ((&rest &key &allow-other-keys) (setf unbounded t state :rest))
+        ((&rest &body) (setf state :rest tail :rest))  ; a later &key overrides
+        (&key (setf state :key tail :keys))
+        (&allow-other-keys (setf other-keys :allowed))
         (&aux (setf state :aux))
         (t (case state
-             (:required (incf min) (incf max))
-             (:optional (incf max))))))
-    (values min (unless unbounded max))))
+             (:required (incf min) (incf positional))
+             (:optional (incf positional))
+             (:key (push (key-name item) keys))))))
+    (make-call-shape :min min :positional positional :tail tail
+                     :key-names (reverse keys) :other-keys other-keys)))
+
+(defun keys-gap (old new)
+  "How NEW, which takes keywords after its positional arguments, refuses a
+call OLD accepts, or :COVERS"
+  (let ((old-positional (call-shape-positional old))
+        (new-positional (call-shape-positional new)))
+    (ecase (call-shape-tail old)
+      (:none (if (>= new-positional old-positional)
+                 :covers
+                 "would read old positional arguments as keywords"))
+      (:rest "takes keywords where old took any arguments")
+      (:keys
+       (cond ((/= new-positional old-positional)
+              "moves where the keyword arguments start")
+             ((eq :allowed (call-shape-other-keys new)) :covers)
+             ((eq :allowed (call-shape-other-keys old))
+              "rejects keywords old allowed")
+             (t (let ((dropped (set-difference (call-shape-key-names old)
+                                               (call-shape-key-names new))))
+                  (if dropped
+                      (format nil "drops keyword~p ~{~s~^, ~}"
+                              (length dropped) dropped)
+                      :covers))))))))
+
+(defun call-shape-gap (old new)
+  "How call shape NEW refuses a call OLD accepts, or :COVERS"
+  (cond ((> (call-shape-min new) (call-shape-min old))
+         "requires more arguments")
+        (t (ecase (call-shape-tail new)
+             (:rest :covers)
+             (:none (if (and (eq :none (call-shape-tail old))
+                             (>= (call-shape-positional new)
+                                 (call-shape-positional old)))
+                        :covers
+                        "accepts fewer arguments"))
+             (:keys (keys-gap old new))))))
 
 (defun check-arity-compatibility (ps fp)
   "New implementation must accept every call shape the old one accepted."
@@ -114,14 +171,12 @@ This is such a cool use of code as data."
         (check-arity-covers ps fp old new))))
 
 (defun check-arity-covers (ps fp old new)
-  "Veto PS unless lambda list NEW accepts every call shape lambda list OLD does"
-  (multiple-value-bind (old-min old-max) (parse-arity old)
-    (multiple-value-bind (new-min new-max) (parse-arity new)
-      (when (or (> new-min old-min)
-                (and new-max (or (null old-max) (< new-max old-max))))
-        (veto ps :static-arity
-              (format nil "~a: old accepts [~a,~a], new only [~a,~a]"
-                      (fn-patch-name fp) old-min old-max new-min new-max))))))
+  "Veto PS unless lambda list NEW accepts every call lambda list OLD does"
+  (let ((gap (call-shape-gap (parse-call-shape old) (parse-call-shape new))))
+    (unless (eq gap :covers)
+      (veto ps :static-arity
+            (format nil "~a: new code ~a; old ~s, new ~s"
+                    (fn-patch-name fp) gap old new)))))
 
 (defun check-inlining-hazard (ps fp)
   "Callers may have inlined a proclaimed-inline function, bypassing a shim."
@@ -181,16 +236,17 @@ This is such a cool use of code as data."
           (fn-patch-old-source-hash fp) (sha256-hex (princ-to-string old)))))
 
 (defun find-old-method (mp)
-  "The method MP replaces, or NIL when the generic function has none."
-  (find-method (fdefinition (method-patch-gf-name mp))
-               (method-patch-qualifiers mp)
-               (mapcar #'find-class (method-patch-specializer-names mp))
-               nil))
+  "The method MP replaces or :NO-METHOD"
+  (or (find-method (fdefinition (method-patch-gf-name mp))
+                   (method-patch-qualifiers mp)
+                   (mapcar #'find-class (method-patch-specializer-names mp))
+                   nil)
+      :no-method))
 
 (defun capture-old-method (ps mp)
   "Check MP's method exists, then record it for rollback."
   (let ((method (find-old-method mp)))
-    (unless method
+    (when (eq method :no-method)
       (veto ps :static-missing
             (format nil "no method (~a ~{~a~^ ~})"
                     (method-patch-gf-name mp)
@@ -278,19 +334,20 @@ printed error when the check signaled one."
                           :verdict verdict :detail detail))
 
 (defun run-contracts (ps &key (phase :pre-flight))
-  "Run every contract. A failure signals PATCH-VETOED at pre-flight, or
-returns the failing contract's name at runtime. Returns T when all pass.
+  "Run every contract. Returns :PASS, or at runtime (values :FAIL name) for
+the first failing contract. A failure at pre-flight signals PATCH-VETOED.
 Contracts run outside any task, so a plain call reaches old code."
   (let ((*contract-context* ps)
         (*task-epochs* nil))
-    (dolist (contract (patch-set-contracts ps) t)
+    (dolist (contract (patch-set-contracts ps) :pass)
       (multiple-value-bind (verdict detail) (check-contract contract)
         (cond ((and (eq verdict :fail) (eq phase :pre-flight))
                (veto ps (contract-name contract) (or detail "check returned NIL")))
               (t
                (audit-contract-result ps contract phase verdict detail)
                (when (eq verdict :fail)
-                 (return-from run-contracts (contract-name contract)))))))))
+                 (return-from run-contracts
+                   (values :fail (contract-name contract))))))))))
 
 (defun new (name)
   "Inside a contract check: the patch set's new implementation of NAME."
@@ -382,8 +439,11 @@ call goes through &REST and APPLY, so it is slower than a fixed-arity shim."
 range or can't be read"
   (if (eq :unknown lambda-list)
       :variadic
-      (multiple-value-bind (min max) (parse-arity lambda-list)
-        (if (and max (= min max)) min :variadic))))
+      (let ((shape (parse-call-shape lambda-list)))
+        (if (and (eq :none (call-shape-tail shape))
+                 (= (call-shape-min shape) (call-shape-positional shape)))
+            (call-shape-min shape)
+            :variadic))))
 
 (defun install-fn-shims (ps)
   (dolist (fp (patch-set-fn-patches ps))

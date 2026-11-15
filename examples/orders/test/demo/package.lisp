@@ -31,7 +31,7 @@ comes back afterwards and the file is deleted"
     (unwind-protect (funcall fn path)
       (splice:close-audit-log)
       (setf splice:*audit-log* previous)
-      (uiop:delete-file-if-exists path))))
+      (splice: delete-audit-log path))))
 
 (defmacro with-demo-log ((path) &body body)
   "Run BODY with PATH bound to the log CALL-WITH-DEMO-LOG opens up"

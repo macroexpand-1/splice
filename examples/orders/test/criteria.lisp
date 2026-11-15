@@ -42,14 +42,14 @@
   (let ((v (sb-ext:posix-getenv "SPLICE_RUNS")))
     (if v (parse-integer v) 100)))
 
-(defun check (name ok detail)
+(defun check name ok detail
   (format t "~:[FAIL~;ok  ~] ~a~@[: ~a~]~%" ok name detail)
   (unless ok (push (list name detail) *failures*))
   (push (list name ok detail) *report*)
   ok)
 
 (defun median (numbers)
-  (let ((s (sort (remove nil numbers) #'<)))
+  (let ((s (sort (remove-if-not #'integerp numbers) #'<)))
     (when s (nth (floor (length s) 2) s))))
 
 (defun wilson-ci (k n &optional (z 1.96))
@@ -66,7 +66,7 @@
 
 (defun check-reconstruction-checkpoints ()
   (format t "~%--- reconstruction checkpoints (pre-patch / mid-canary / post-rollback)~%")
-  (let ((log (scratch-file "splice-criteria-checkpoint.log")))
+  (let ((log (fresh-scratch-log "splice-criteria-checkpoint.log")))
     (splice:open-audit-log log)
     (orders:reset-workload)
     (let ((ps (orders:register-currency-patch-set)))
@@ -94,7 +94,7 @@
 
 (defun check-resume-after-hard-trigger ()
   (format t "~%--- resume after a hard trigger on a lossy set~%")
-  (let ((log (scratch-file "splice-criteria-resume.log")))
+  (let ((log (fresh-scratch-log "splice-criteria-resume.log")))
     (splice:open-audit-log log)
     (orders:reset-workload)
     (let ((corrupted (first (orders:make-pre-existing-orders (orders:make-rng 41) 1 :corrupted 1)))
@@ -139,7 +139,7 @@ type-check the shim's :NEW into an error."
 
 (defun check-runtime-contract-routing ()
   (format t "~%--- runtime contracts call old code through the shims~%")
-  (let* ((log (scratch-file "splice-criteria-runtime-contract.log"))
+  (let* ((log (fresh-scratch-log "splice-criteria-runtime-contract.log"))
          (seen '())
          (ps (splice::make-patch-set
               :name 'route-probe-patch
@@ -214,7 +214,8 @@ what the rollback left behind."
              (and cmp (= (getf cmp :snapshot-restored) (getf cmp :snapshot-total)))
              (format nil "~a/~a" (getf cmp :snapshot-restored)
                      (getf cmp :snapshot-total))))
-    (let ((rev (first (orders:session-result-reversal-report r))))
+    (let* ((report (orders:session-result-reversal-report r))
+           (rev (and (listp report) (first report))))
       ;; a report exists only when every instance reversed: the first
       ;; failure aborts the rollback and freezes the set
       (check "Flagship: reverse migration completed without failures"
@@ -254,9 +255,9 @@ migrated forward mid-canary, then restored)"
   (let ((b (make-batch :kind kind :runs *runs*)))
     (dotimes (i *runs*)
       (let* ((r (orders:run-canary-session :fault kind
-                                            :seed (+ 10000 (* 131 i)
-                                                     (if kind (sxhash kind) 0))
-                                            :threads (or threads 1) :quiet t))
+                                           :seed (+ 10000 (* 131 i)
+                                                    (if kind (sxhash kind) 0))
+                                           :threads (or threads 1) :quiet t))
              (state (orders:session-result-final-state r)))
         (push state (batch-final-states b))
         (when (eq state :rolled-back)
@@ -330,7 +331,7 @@ RELEASE. Returns the thread once the pin is counted."
 
 (defun check-promotion-waits-for-drain ()
   (format t "~%--- C3: promotion freezes rather than swap past an undrained :old task~%")
-  (let ((log (scratch-file "splice-criteria-drain.log"))
+  (let ((log (fresh-scratch-log "splice-criteria-drain.log"))
         (release (sb-thread:make-semaphore))
         (saved splice::*drain-timeout-seconds*))
     (splice:open-audit-log log)
@@ -442,7 +443,7 @@ RELEASE. Returns the thread once the pin is counted."
     (check "C5: final image state reconstructed from log matches live image"
            ok mismatches))
   ;; tamper detection
-  (let ((tampered (scratch-file "splice-criteria-tampered.log")))
+  (let ((tampered (fresh-scratch-log "splice-criteria-tampered.log")))
     (with-open-file (in *big-log*)
       (with-open-file (out tampered :direction :output :if-exists :supersede)
         (loop for line = (read-line in nil) while line
@@ -502,7 +503,7 @@ and the full-log checks run last."
         (*failures* '())
         (*report* '())
         (*batches* '())
-        (*big-log* (scratch-file "splice-criteria.log")))
+        (*big-log* (fresh-scratch-log "splice-criteria.log")))
     (format t "~%=== splice criteria runner (~a runs per class) ===~%" *runs*)
     (check-reconstruction-checkpoints)
     (check-resume-after-hard-trigger)

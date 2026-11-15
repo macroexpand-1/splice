@@ -76,6 +76,7 @@ HOST (if given) gets MEMBER-COMMITTED and FINAL-REPORT-FIELDS"
            (setf (sb-bsd-sockets:sockopt-reuse-address server) t)
            (sb-bsd-sockets:socket-bind server #(127 0 0 1) port)
            (sb-bsd-sockets:socket-listen server 1)
+           (splice:delete-audit-log log-path)
            (splice:open-audit-log log-path)
            (serve-conductor server log-path host))
       (splice:close-audit-log)
@@ -146,6 +147,7 @@ once the stream ends"
   "MEMBERS-SPEC is a list of (host port). Ship SPEC to every member over TCP to run
 the cluster to the end. Returns one final report per member, which is a plist headed :PORT.
 Signals an error if a member vetoed"
+  (splice:delete-audit-log log-path)
   (splice:open-audit-log log-path)
   (let ((streams '()))                  ; ((port . stream) ...), newest first
     (unwind-protect

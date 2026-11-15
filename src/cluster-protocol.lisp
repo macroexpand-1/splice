@@ -252,14 +252,14 @@ for ALPHA and BETA (as each member's SPRT does)"
   (eq :stalled (member-view-state view)))
 
 (defun rollback-trigger (cluster)
-  "Why the cluster should roll back right now or NIL"
+  "Why the cluster should roll back right now or :NO-TRIGGER"
   (cond ((some #'member-rolled-back-p (cluster-members cluster))
          :member-local-reject)
         ((some #'member-stalled-p (cluster-members cluster))
          :member-stalled)
         ((>= (pooled-llr-milli cluster) (cluster-upper-milli cluster))
          :pooled-sprt-reject)
-        (t nil)))
+        (t :no-trigger)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Step: transition for one conductor event
@@ -439,7 +439,8 @@ and reports :DIED"
   "Broadcast :ROLLBACK on a member's local rollback or when the pooled
 LLR reaches the upper bound"
   (let ((trigger (rollback-trigger cluster)))
-    (if (and trigger (not (cluster-rollback-sent cluster)))
+    (if (and (not (eq trigger :no-trigger))
+             (not (cluster-rollback-sent cluster)))
         (values (cluster-with cluster :rollback-sent t)
                 (cons (list :audit :cluster-rollback
                             :pooled-llr (/ (pooled-llr-milli cluster) 1000.0)
@@ -583,10 +584,12 @@ Returns MESSAGE's kind"
 
 (defun member-bye (cluster-member)
   "Let a set that is rolling back finish, so its last audit entries are written
-before the transport closes the log. An abort during COMMIT ends this way"
+before the transport closes the log. An abort during COMMIT ends this way.
+Returns the state it waited for, :TIMEOUT or :NOT-ROLLING-BACK"
   (let ((ps (member-patch-set cluster-member)))
-    (when (and ps (splice::rolling-back-p (splice:patch-set-state ps)))
-      (splice:wait-for-state ps '(:rolled-back :frozen) :timeout 30))))
+    (if (and ps (splice::rolling-back-p (splice:patch-set-state ps)))
+        (splice:wait-for-state ps '(:rolled-back :frozen) :timeout 30)
+        :not-rolling-back)))
 
 (defun member-prepare (cluster-member spec)
   (handler-case
@@ -614,9 +617,9 @@ is in after 2 minutes"
   (sb-thread:make-thread
    (lambda ()
      (let ((terminal '(:promoted :rolled-back :frozen)))
-       (unless (splice:wait-for-state ps terminal :timeout 120)
+       (when (eq :timeout (splice:wait-for-state ps terminal :timeout 120))
          (member-reply cluster-member (list :stalled :state (splice:patch-set-state ps)))
-         (loop until (splice:wait-for-state ps terminal :timeout 60)))
+         (loop while (eq :timeout (splice:wait-for-state ps terminal :timeout 60))))
        (member-reply cluster-member (list :terminal :state (splice:patch-set-state ps)))))
    :name (format nil "splice-member-watch-~a" (splice:patch-set-name ps))))
 

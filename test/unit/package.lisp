@@ -32,7 +32,7 @@
      (splice:open-audit-log ,path)
      (unwind-protect (progn ,@body)
        (splice:close-audit-log)
-       (uiop:delete-file-if-exists ,path))))
+       (splice:delete-audit-log ,path))))
 
 (defmacro with-temp-log-path ((path) &body body)
   "Run BODY with a fresh, unopened log PATH. Close + Delete after"

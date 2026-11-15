@@ -107,7 +107,7 @@ LIMIT observations go by. Returns the verdict."
       (splice::control-record ring failure-p latency))))
 
 (test failure-rate-needs-enough-samples
-  (is (null (splice::control-failure-rate (ring-with (make-list 29)))))
+  (is (eq :too-few-samples (splice::control-failure-rate (ring-with (make-list 29)))))
   (is (= 0 (splice::control-failure-rate (ring-with (make-list 30))))))
 
 (test failure-rate-counts-failures
@@ -133,4 +133,5 @@ LIMIT observations go by. Returns the verdict."
     (is (= 1 (splice::control-latency-quantile ring 0.0)))))
 
 (test latency-quantile-needs-enough-samples
-  (is (null (splice::control-latency-quantile (ring-with (make-list 29)) 0.5))))
+  (is (eq :too-few-samples
+          (splice::control-latency-quantile (ring-with (make-list 29)) 0.5))))

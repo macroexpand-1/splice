@@ -27,13 +27,14 @@
    #:migration-journal-count #:reverse-migration-report
 
    ;; audit
-   #:open-audit-log #:close-audit-log #:audit #:*audit-log*
+   #:open-audit-log #:resume-audit-log #:close-audit-log #:delete-audit-log
+   #:audit #:*audit-log*
    #:verify-audit-chain #:reconstruct-state #:verify-reconstruction
 
    ;; conditions & restarts
    #:splice-condition #:patch-vetoed #:canary-anomaly #:canary-verdict
    #:migration-failure #:rollback-initiated #:rollback-failure
-   #:illegal-transition #:operator-decision
+   #:illegal-transition #:operator-decision #:unknown-patch-set
    #:fallback-to-old #:roll-back-patch #:freeze-patch #:promote-anyway
    #:let-splice-decide #:with-operator-decisions
 
@@ -48,8 +49,7 @@
    #:rollback-initiated-trigger #:rollback-failure-cause
    #:operator-decision-point #:operator-decision-default
    #:operator-decision-cause
+   #:unknown-patch-set-name
 
    ;; utilities
    #:sha256-hex #:sha256-self-test))
-
-   #:resume-audit-log #:delete-audit-log

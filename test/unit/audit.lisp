@@ -47,7 +47,7 @@
 
 (test audit-without-a-log-is-a-no-op
   (let ((splice:*audit-log* nil))
-    (is (null (splice:audit :probe :n 1)))))
+    (is (eq :unlogged (splice:audit :probe :n 1)))))
 
 (test audit-returns-sequence-numbers
   (with-audit-log (path)
@@ -174,17 +174,17 @@
 ;;; ---------------------------------------------------------------------
 ;;; Closing under writers
 
-(test auditing-a-closed-log-returns-nil
+(test auditing-a-closed-log-is-unlogged
   (with-temp-log-path (path)
     (let ((log (splice:open-audit-log path)))
       (splice:close-audit-log)
       (let ((splice:*audit-log* log))
-        (is (null (splice:audit :probe :n 1)))))))
+        (is (eq :unlogged (splice:audit :probe :n 1)))))))
 
 (defun audit-until-closed (log)
   "Write 2000 entries to LOG from this thread. Count lands or (:ERROR text)"
   (let ((splice*audit-log* log))
-    (handler-case (loop repeat 2000 count (splice:audit :probe :n 1))
+    (handler-case (loop repeat 2000 count (integerp (splice:audit :probe :n 1)))
       (error (e) (list :error (princ-to-string e))))))
 
 (test closing-under-writers-loses-no-line-and-signals-nothing
@@ -240,16 +240,16 @@
   (let ((state (fold (registered 's :functions '(f g) :classes '(c))
                      (event :install 's))))
     (is (eq :staged (state-of state 's)))
-    (is (eq :shimmed (impl-of state 'f)))
-    (is (eq :shimmed (impl-of state 'g)))
-    (is (eq :union (shape-of state 'c)))))
+    (is (equal '(:shimmed s) (impl-of state 'f)))
+    (is (equal '(:shimmed s) (impl-of state 'g)))
+    (is (equal '(:union s) (shape-of state 'c)))))
 
 (test a-canary-transition-moves-only-the-set
   (let ((state (fold (registered 's :functions '(f))
                      (event :install 's)
                      (event :canary-transition 's :to :canary-25))))
     (is (eq :canary-25 (state-of state 's)))
-    (is (eq :shimmed (impl-of state 'f)))))
+    (is (equal '(:shimmed s) (impl-of state 'f)))))
 
 (test promotion-points-at-the-new-code
   (let ((state (fold (registered 's :functions '(f) :classes '(c))
@@ -257,15 +257,15 @@
                      (event :promotion 's))))
     (is (eq :promoted (state-of state 's)))
     (is (equal '(:new s) (impl-of state 'f)))
-    (is (eq :new (shape-of state 'c)))))
+    (is (equal '(:new s) (shape-of state 'c)))))
 
 (test rollback-restores-the-originals
   (let ((state (fold (registered 's :functions '(f) :classes '(c))
                      (event :install 's)
                      (event :rollback-complete 's))))
     (is (eq :rolled-back (state-of state 's)))
-    (is (eq :original (impl-of state 'f)))
-    (is (eq :original (shape-of state 'c)))))
+    (is (equal '(:original s) (impl-of state 'f)))
+    (is (equal '(:original s) (shape-of state 'c)))))
 
 (test only-a-veto-verdict-vetoes
   (is (eq :vetoed (state-of (fold (registered 's)
@@ -308,7 +308,7 @@
     (let ((state (splice:reconstruct-state path)))
       (is (eq :promoted (state-of state 'rs)))
       (is (equal '(:new rs) (impl-of state 'f)))
-      (is (eq :new (shape-of state 'c))))))
+      (is (equal '(:new rs) (shape-of state 'c))))))
 
 (test reconstruct-state-refuses-a-broken-chain
   (with-audit-log (path)
