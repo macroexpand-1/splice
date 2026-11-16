@@ -42,7 +42,7 @@
   (let ((v (sb-ext:posix-getenv "SPLICE_RUNS")))
     (if v (parse-integer v) 100)))
 
-(defun check name ok detail
+(defun check (name ok detail)
   (format t "~:[FAIL~;ok  ~] ~a~@[: ~a~]~%" ok name detail)
   (unless ok (push (list name detail) *failures*))
   (push (list name ok detail) *report*)

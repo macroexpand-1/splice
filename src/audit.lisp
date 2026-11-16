@@ -122,7 +122,7 @@ Returns the entry's sequence number or :UNLOGGED"
 ;;; ---------------------------------------------------------------------
 ;;; Offline: chain verification
 
-(defun read-entry-or-readable (line)
+(defun read-entry-or-unreadable (line)
   "The entry LINE holds or :UNREADABLE"
   (handler-case (let ((entry (entry-of-line line)))
                   (if (and (consp entry) (integerp (getf entry :seq)))
@@ -163,7 +163,7 @@ gets a short list. Streams, so large logs never sit in memory."
 break-seq), where BREAK-SEQ is the first entry whose :prev-hash mismatches."
   (map-audit-entries path nil))
 
-(defun last-two-line (path)
+(defun last-two-lines (path)
   "Last line of the file at PATH and the one before it. Eaach can be :EMPTY"
   (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
     (loop with previous = :empty
@@ -190,7 +190,7 @@ torn or still being written - chain continues."
 
 (defun chain-tail (path)
   "Where the chain at PATH left off: last seq and the hash of the line it continues from"
-  (let ((line (if (probe-file path) (last-line path) :empty)))
+  (let ((line (if (probe-file path) (tail-line path) :empty)))
     (if (eq line :empty)
         (values 0 "genesis")
         (values (getf (entry-of-line line) :seq) (sha256-hex line)))))
@@ -240,11 +240,9 @@ torn or still being written - chain continues."
   (multiple-value-bind (ok count break-seq reason) (verify-audit-chain path)
     (declare (ignore count))
     (unless ok
-      (error "audit log ~a does not verify (~(~a~)@[ at seq ~a~]); refusing to append"
+      (error "audit log ~a does not verify (~(~a~)~@[ at seq ~a~]); refusing to append"
              path reason break-seq))
     :intact))
-
-B
 
 (defun repair-or-refuse (path)
   "Make the PATH safe to append to. Returns :INTACT, :NEWLIE-ADDED, or the fields
@@ -253,10 +251,10 @@ of a cut torn tale; singals on any other break"
     (declare (ignore count break-seq))
     (cond ((and ok (missing-final-newline-p path)) (terminate-last-line path))
           (ok :intact)
-          ((eq reason :torn-tail (let ((cut (cut-torn-tail path)))
-                                   (refuse-broken-chain path)
-                                   cut))
-           (t (refuse-broken-chain path))))))
+          ((eq reason :torn-tail) (let ((cut (cut-torn-tail path)))
+                                    (refuse-broken-chain path)
+                                    cut))
+          (t (refuse-broken-chain path)))))
 
 (defun boot-fields ()
   "What a :BOOT entry records about this process"

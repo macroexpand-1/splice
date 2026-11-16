@@ -144,7 +144,7 @@
     (splice:close-audit-log)
     (let ((entry (first (log-entries path))))
       (is (eq :boot (getf entry :event)))
-      (is (= 1 (get entry :seq)))
+      (is (= 1 (getf entry :seq)))
       (is (string= "genesis" (getf entry :prev-hash)))
       (is (string= splice::*boot-id* (getf entry :full-boot-id))))))
 
@@ -167,7 +167,7 @@
     (splice:open-audit-log path)
     (splice:audit :probe :n 1)
     (splice:close-audit-log)
-    (with-open-file (out path :direction :output :if-existings :append)
+    (with-open-file (out path :direction :output :if-exists :append)
       (write-line "(:SEQ 2 :PREV-HASH \"forged\" :EVENT :PROBE" out))
     (signals error (splice:resume-audit-log path))))
 
@@ -183,7 +183,7 @@
 
 (defun audit-until-closed (log)
   "Write 2000 entries to LOG from this thread. Count lands or (:ERROR text)"
-  (let ((splice*audit-log* log))
+  (let ((splice:*audit-log* log))
     (handler-case (loop repeat 2000 count (integerp (splice:audit :probe :n 1)))
       (error (e) (list :error (princ-to-string e))))))
 
@@ -197,7 +197,7 @@
       (splice:close-audit-log)
       (let ((landed (mapcar #'sb-thread:join-thread threads)))
         (is (every #'integerp landed))
-        (is (= (reduce #'+ landed) (length (log-line path))))
+        (is (= (reduce #'+ landed) (length (log-lines path))))
         (is-true (splice:verify-audit-chain path))))))
 
 ;;; ---------------------------------------------------------------------
@@ -328,10 +328,10 @@
 
 (defun append-octets (path octets)
   "Append OCTETS to the file at PATH, since a crash mid-write would leave them"
-  (with-open-file (out path :direction output :if-exists :append
+  (with-open-file (out path :direction :output :if-exists :append
                             :if-does-not-exist :create
-                            :elementy-type '(unsigned-byte 8))
-    (write-sequences (coerce octets '(vector (unsigned-byte 8))) out)))
+                            :element-type '(unsigned-byte 8))
+    (write-sequence(coerce octets '(vector (unsigned-byte 8))) out)))
 
 (defun torn-line-octets ()
   "Start of an entry cut inside a two-octet character."
@@ -350,13 +350,13 @@
     (is (equal '(nil 2 3 :torn-tail)
                (multiple-value-list (splice:verify-audit-chain path))))))
 
-(defun an-unreadable-whole-line-is-not-a-torn-tail
-    (with-temp-log-path (path)
-      (write-probe-log 2)
-      (with-open-file (out path :direction :output :if-exists :append)
-        (write-line "(:SEQ 3 :TS" out))
-      (is (equal '(nil 2 3 :unreadable)
-           (multiple-value-list (splice:verify-audit-chain path))))))
+(test an-unreadable-whole-line-is-not-a-torn-tail
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (with-open-file (out path :direction :output :if-exists :append)
+      (write-line "(:SEQ 3 :TS" out))
+    (is (equal '(nil 2 3 :unreadable)
+               (multiple-value-list (splice:verify-audit-chain path))))))
 
 (test resuming-cuts-a-torn-tail-audits-the-cut
   (with-temp-log-path (path)
@@ -371,7 +371,7 @@
         (is (= (length torn) (getf cut :bytes)))
         (is (string= (splice::sha256-octets-hex torn) (getf cut :sha256))))
       (is (eq :boot (getf (fourth (log-entries path)) :event)))
-      (is-true (splice:verify-audit-chain-path)))))
+      (is-true (splice:verify-audit-chain path)))))
 
 (test resuming-completes-a-missing-newline
   (with-temp-log-path (path)
@@ -400,17 +400,6 @@
       (is (= 0 (getf cut :after-seq)))
       (is (string= "genesis" (getf cut :prev-hash))))
     (is-true (splice:verify-audit-chain path))))
-
-(defun a-log-that-is-only-a-torn-line-resumes-at-genesis
-    (with-temp-log-path (path)
-      (append-octets path (torn-line-octets))
-      (splice:resume-audit-log path)
-      (splice:close-audit-log)
-      (let ((cut (first (log-entries path))))
-        (is (eq :torn-tail (getf cut :event)))
-        (is (= 0 (getf cut :after-seq)))
-        (is (string= "genesis" (getf cut :prev-hash))))
-      (is-true (splice:verify-audit-chain path))))
 
 (test the-chain-tail-passes-over-a-torn-last-line
   (with-temp-log-path (path)

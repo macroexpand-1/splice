@@ -85,12 +85,11 @@
 ;;; Lambda lists
 
 (test lambda-list-of-agrees-with-sb-introspect
-  (let* ((probe (splice::make-patch-set :name 'arity-probe))
-         (cases (list #'probe-one
-                      #'probe-two
-                      (compile nil '(lambda (a &optional b) (list a b)))
-                      (funcall (compile nil '(lambda (x) (lambda (a b) (+ a b x)))) 1)
-                      #'print-object)))
+  (let ((cases (list #'probe-one
+                     #'probe-two
+                     (compile nil '(lambda (a &optional b) (list a b)))
+                     (funcall (compile nil '(lambda (x) (lambda (a b) (+ a b x)))) 1)
+                     #'print-object)))
     (dolist (f cases)
       (is (equalp (splice::parse-call-shape (splice::lambda-list-of f))
                   (splice::parse-call-shape (sb-introspect:function-lambda-list f)))

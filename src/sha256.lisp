@@ -99,7 +99,7 @@
 (defun string-to-utf8 (string)
   (sb-ext:string-to-octets string :external-format :utf-8))
 
-(defun sha256-octects-hex (octets)
+(defun sha256-octets-hex (octets)
   "Hex SHA-256 of the octet vector OCTETS"
   (string-downcase
    (with-output-to-string (s)

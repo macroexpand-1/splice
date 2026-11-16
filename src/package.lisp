@@ -2,6 +2,7 @@
 
 (defpackage #:splice
   (:use #:common-lisp)
+
   (:export
    ;; patch-set declaration and registry
    #:defpatch-set #:register-patch-set #:find-patch-set #:unregister-patch-set
@@ -52,4 +53,4 @@
    #:unknown-patch-set-name
 
    ;; utilities
-   #:sha256-hex #:sha256-self-test))
+   #:sha256-hex #:sha256-octets-hex #:sha256-self-test))
