@@ -20,6 +20,18 @@
 (defconstant +unix-epoch-universal-time+ 2208988800
   "Universal epoch time (1970-01-01T00:00:00Z)")
 
+(defun truncate-file (path length)
+  "Cut the file at PATH to LENGTH octets. Returns LENGTH"
+  (let ((result (sb-alien:alien-funcall
+                 (sb-alien:extern-alien "truncate"
+                                        (function sb-alien:int sb-alien:c-string
+                                                  (sb-alien:signed 64)))
+                 (sb-ext:native-namestring (truename path))
+                 length)))
+    (unless (zerop result)
+      (error "truncating ~a to ~a octets failed" path length))
+    length))
+
 ;;; ---------------------------------------------------------------------
 ;;; Writing the log
 
@@ -183,13 +195,68 @@ torn or still being written - chain continues."
         (values 0 "genesis")
         (values (getf (entry-of-line line) :seq) (sha256-hex line)))))
 
-(defun check-chain-intact (path)
-  "Signal an error when the log at PATH has a broken chain. Return :INTACT"
-  (multiple-value-bind (ok count break-seq) (verify-audit-chain path)
+(defun last-newline-end (path)
+  "Octet offeset past the last newline in the file at PATH or 0"
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (loop for pos from (1- (file-length in)) downto 0
+          do (file-position in pos)
+             (when (= 10 (read-byte in))
+               (return (1+ pos)))
+          finally (return 0))))
+
+(defun tail-octets (path start)
+  "Octets of the file at PATH from START to its end"
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((octets (make-array (- (file-length in) start)
+                              :element-type '(unsigned-byte 8))))
+      (file-position in start)
+      (read-sequence octets in)
+      octets)))
+
+(defun cut-torn-tail (path)
+  "Cut the torn last line off the log at PATH. Returns :TORN-TAIL fields"
+  (let* ((start (last-newline-end path))
+         (octets (tail-octets path start)))
+    (truncate-file path start)
+    (list :after-seq (chain-tail path)
+          :bytes (length octets)
+          :sha256 (sha256-octets-hex octets))))
+
+(defun missing-final-newline-p (path)
+  "Tree when the file at PATH ends i a line with no newline"
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (and (plusp (file-length in))
+         (progn (file-position in (1- (file-length in)))
+                (/= 10 (read-byte in))))))
+
+(defun terminate-last-line (path)
+  "Append the newline a complete last line is missing. Returns :NEWLINE-ADDED"
+  (with-open-file (out path :direction :output :if-exists :append)
+    (terpri out))
+  :newline-added)
+
+(defun refuse-broken-chain (path)
+  "Signal unless the log at PATH verifies. Returns :INTACT"
+  (multiple-value-bind (ok count break-seq reason) (verify-audit-chain path)
     (declare (ignore count))
     (unless ok
-      (error "audit chain broken at seq ~a; refusing to append" break-seq))
+      (error "audit log ~a does not verify (~(~a~)@[ at seq ~a~]); refusing to append"
+             path reason break-seq))
     :intact))
+
+B
+
+(defun repair-or-refuse (path)
+  "Make the PATH safe to append to. Returns :INTACT, :NEWLIE-ADDED, or the fields
+of a cut torn tale; singals on any other break"
+  (multiple-value-bind (ok count break-seq reason) (verify-audit-chain path)
+    (declare (ignore count break-seq))
+    (cond ((and ok (missing-final-newline-p path)) (terminate-last-line path))
+          (ok :intact)
+          ((eq reason :torn-tail (let ((cut (cut-torn-tail path)))
+                                   (refuse-broken-chain path)
+                                   cut))
+           (t (refuse-broken-chain path))))))
 
 (defun boot-fields ()
   "What a :BOOT entry records about this process"
@@ -200,16 +267,17 @@ torn or still being written - chain continues."
 
 (defun resume-audit-log (path)
   "Append to the log at PATH, continuing the chaing, and record this boot"
-  (when (probe-file path)
-    (check-chain-intact path))
-  (multiple-value-bind (seq prev-hash) (chain-tail path)
-    (setf *audit-log*
-          (%make-audit-log :path path :seq seq :prev-hash prev-hash
-                           :stream (open path :direction :output
-                                              :if-exists :append
-                                              :if-does-not-exist :create))))
-  (apply #'audit :boot (boot-fields))
-  *audit-log*)
+  (let ((repair (if (probe-file path) (repair-or-refuse path) :intact)))
+    (multiple-value-bind (seq prev-hash) (chain-tail path)
+      (setf *audit-log*
+            (%make-audit-log :path path :seq seq :prev-hash prev-hash
+                             :stream (open path :direction :output
+                                                :if-exists :append
+                                                :if-does-not-exist :create))))
+    (when (consp repair)
+      (apply #'audit :torn-tail repair))
+    (apply #'audit :boot (boot-fields))
+    *audit-log*))
 
 ;;; ---------------------------------------------------------------------
 ;;; Offline: state reconstruction

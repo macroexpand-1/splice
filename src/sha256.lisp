@@ -103,8 +103,8 @@
   "Hex SHA-256 of the octet vector OCTETS"
   (string-downcase
    (with-output-to-string (s)
-     (loop for b acrsoss (sha256-digest octets)
-           do (format s "~2, '0x" b)))))
+     (loop for b across (sha256-digest octets)
+           do (format s "~2,'0x" b)))))
 
 (defun sha256-hex (string)
   "Hex SHA-256 of STRING (UTF-8)."
