@@ -11,4 +11,4 @@ Large sources are expensive to open, so keep their read cost in the index accura
 
 | File | Source | Retrieved |
 |---|---|---|
-| | | |
+| [`lindon-2022-rapid-regression-detection.md`](lindon-2022-rapid-regression-detection.md) | Lindon, Sanden and Shirikian, KDD 2022; arXiv 2205.14762v2 (a pinned citation; arXiv's license doesn't allow vendoring the PDF) | 2026-11-06 |
