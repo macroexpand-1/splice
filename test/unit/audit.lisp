@@ -168,7 +168,7 @@
     (splice:audit :probe :n 1)
     (splice:close-audit-log)
     (with-open-file (out path :direction :output :if-exists :append)
-      (write-line "(:SEQ 2 :PREV-HASH \"forged\" :EVENT :PROBE" out))
+      (write-line "(:SEQ 2 :PREV-HASH \"forged\" :EVENT :PROBE)" out))
     (signals error (splice:resume-audit-log path))))
 
 ;;; ---------------------------------------------------------------------
@@ -413,3 +413,107 @@
     (write-probe-log path 2)
     (append-octets path (torn-line-octets))
     (signals error (splice::map-audit-entries path nil :verify nil))))
+
+;;; ---------------------------------------------------------------------
+;;; Durability and the checkpoint
+
+(defun first-line-octets (path)
+  "How many octets the first line of the log at PATH takes (includes newlines)"
+  (1+ (length (sb-ext:string-to-octets (first (log-lines path))
+                                       :external-format :utf-8))))
+
+(test every-entry-leaves-a-checkpoint-at-the-tail
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (multiple-value-bind (seq hash) (splice::read-checkpoint path)
+      (is (= 3 seq))
+      (is (string= (splice:sha256-hex (third (log-lines path))) hash)))))
+
+(test lines-cut-from-the-end-show-as-truncated
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (splice::truncate-file path (first-line-octets path))
+    (is (equal '(nil 1 nil :truncated)
+               (multiple-value-list (splice:verify-audit-chain path))))
+    (signals error (splice:resume-audit-log path))
+    (signals error (splice:reconstruct-state path))))
+
+(test a-log-one-entry-ahead-of-its-checkpoint-verifies
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (close (splice::open-checkpoint path 2 (splice:sha256-hex (second (log-lines path)))))
+    (is (equal '(t 3 nil :intact)
+               (multiple-value-list (splice:verify-audit-chain path))))))
+
+(test a-log-with-out-its-checkpoint-is-unanchored-until-anchored
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (delete-file (splice::checkpoint-path path))
+    (is (equal '(nil 3 nil :unanchored)
+               (multiple-value-list (splice:verify-audit-chain path))))
+    (signals error (splice:resume-audit-log path))
+    (is (= 3 (splice:anchor-audit-log path)))
+    (splice:resume-audit-log path)
+    (splice:close-audit-log)
+    (is-true (splice:verify-audit-chain path))))
+
+(test an-unreadable-checkpoint-fails-verification
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (with-open-file (out (splice::checkpoint-path path) :direction :output
+                                                        :if-exists :supersede)
+      (write-line "not a checkpoint" out))
+    (is (eq :unreadable-checkpoint
+            (nth-value 3 (splice:verify-audit-chain path))))))
+
+(test a-deleted-log-with-its-checkpoint-left-refuses-to-resume
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (delete-file path)
+    (signals error (splice:resume-audit-log path))))
+
+(test deleting-a-log-deletes-its-checkpoint
+  (with-temp-log-path (path)
+    (write-probe-log path 1)
+    (is (eq :deleted (splice:delete-audit-log path)))
+    (is (null (probe-file (splice::checkpoint-path path))))))
+
+(test a-failed-fsync-signals
+  (signals error (splice::fsync-fd -1)))
+
+(test a-failed-write-refuses-every-later-entry
+  (with-temp-log-path (path)
+    (let ((log (splice:open-audit-log path)))
+      (splice:audit :probe :n 1)
+      (close (splice::audit-log-checkpoint log))
+      (signals error (splice:audit :probe :n 2))
+      (signals error (splice:audit :probe :n 3))
+      (splice:close-audit-log)
+      (is (equal '(t 2 nil :intact)
+                 (multiple-value-list (splice:verify-audit-chain path)))))))
+
+(test reopening-a-checkpoint-overwrites-it-in-place
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (close (splice::open-checkpoint path 3 (splice:sha256-hex (third (log-lines path)))))
+    (is (= 86 (with-open-file (in (splice::checkpoint-path path)
+                                  :element-type '(unsigned-byte 8))
+                (file-length in))))
+    (is (eq :anchored (splice::check-anchor path)))))
+
+(defun verify-while-writing (log path)
+  "Verify the log at PATH 50 ties while four threads write to LOG"
+  (let ((threads (loop repeat 4
+                       collect (sb-thread:make-thread
+                                (lambda ()
+                                  (let ((splice:*audit-log* log))
+                                    (loop repeat 200 do (splice:audit :probe :n 1))))))))
+    (prog1 (loop repeat 50 collect (nth-value 3 (splice:verify-audit-chain path)))
+      (mapc #'sb-thread:join-thread threads))))
+
+(test a-log-verifies-while-it-is-written
+  (with-temp-log-path (path)
+    (let* ((log (splice:open-audit-log path))
+           (reasons (verify-while-writing log path)))
+      (is (every (lambda (reason) (eq :intact reason)) reasons)
+          "~s" (remove-duplicates reasons)))))
