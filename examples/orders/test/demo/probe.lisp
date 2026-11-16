@@ -37,7 +37,7 @@ promotion and rollback start. Put the global log back after"
     (unwind-protect (funcall fn)
       (splice:close-audit-log)
       (setf splice:*audit-log* previous)
-      (uiop:delete-file-if-exists path))))
+      (splice:delete-audit-log path))))
 
 (defmacro with-probe-log (() &body body)
   "Run BODY inside CALL-WITH-PROBE-LOG"

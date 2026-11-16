@@ -102,3 +102,63 @@
   (let ((ps (bare-set :promoting)))
     (is (eq :promoted (splice::complete-promotion ps)))
     (is (equal '(:swapping :promoted) (state-trail ps)) "trail was ~s" (state-trail ps))))
+
+;;; ---------------------------------------------------------------------
+;;; Hard triggers and waiting
+
+(test taking-a-hard-trigger-leaves-it-unarmed
+  (let ((ps (bare-set :canary-5)))
+    (is (eq :unarmed (splice::take-hard-trigger ps)))
+    (splice::arm-hard-trigger ps '(:storage-condition "probe"))
+    (splice::arm-hard-trigger ps '(:migration-failure "second"))
+    (is (equal '(:storage-condition "probe") (splice::take-hard-trigger ps)))
+    (is (eq :unarmed (splice::take-hard-trigger ps)))))
+
+(test waiting-past-the-deadline-is-a-timeout
+  (is (eq :timeout (splice:wait-for-state (bare-set :staged) '(:promoted) :timeout 0))))
+
+;;; ---------------------------------------------------------------------
+;;; Naming a set
+
+(test an-unknown-set-name-is-an-error
+  (signals splice:unknown-patch-set (splice:freeze 'no-such-set "probe"))
+  (signals splice:unknown-patch-set (splice:roll-back 'no-such-set))
+  (signals splice:unknown-patch-set (splice:current-route 'no-such-set))
+  (signals splice:unknown-patch-set (splice:reverse-migration-report 'no-such-set)))
+
+(test a-set-never-rolled-back-has-no-reversal-report
+  (with-patch-set-names (report-probe)
+    (setf (gethash 'report-probe splice::*patch-sets*)
+          (splice::make-patch-set :name 'report-probe))
+    (is (eq :not-rolled-back (splice:reverse-migration-report 'report-probe)))))
+
+;;; ---------------------------------------------------------------------
+;;; Reconstruction against the live image
+
+(test an-unknown-function-impl-is-an-error
+  (signals error (splice::impl-function (splice::make-fn-patch) '(:bogus s))))
+
+(test an-unpatched-name-has-no-registry-object
+  (is (equal '(no-such-fn :no-registry-object (:original no-such-set))
+             (splice::function-mismatch 'no-such-fn '(:original no-such-set))))
+  (is (equal '(no-such-class :no-registry-object (:union no-such-set))
+             (splice::class-mismatch 'no-such-class '(:union no-such-set)))))
+
+(test lookups-search-only-the-set-the-impl-names
+  (with-patch-set-names (owner-a owner-b)
+    (flet ((register (set-name)
+             (let ((ps (splice::make-patch-set
+                        :name set-name
+                        :fn-patches (list (splice::make-fn-patch :name 'shared-fn))
+                        :class-patches (list (splice::make-class-patch
+                                              :class-name 'shared-class)))))
+               (setf (gethash set-name splice::*patch-sets*) ps))))
+      (let ((a (register 'owner-a))
+            (b (register 'owner-b)))
+        (is (eq (first (splice::patch-set-fn-patches b))
+                (splice::find-fn-patch 'shared-fn '(:new owner-b))))
+        (is (eq (first (splice::patch-set-fn-patches a))
+                (splice::find-fn-patch 'shared-fn '(:original owner-a))))
+        (is (eq (first (splice::patch-set-class-patches b))
+                (splice::find-class-patch 'shared-class '(:new owner-b))))
+        (is (eq :unpatched (splice::find-fn-patch 'shared-fn '(:new owner-c))))))))

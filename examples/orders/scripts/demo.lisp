@@ -31,6 +31,7 @@
   (format t "~%~a~%~a~%" (apply #'format nil fmt args)
           (make-string 72 :initial-element #\-)))
 
+(delete-audit-log *log-path*)
 (open-audit-log *log-path*)
 (format t "~%splice demo, audit log: ~a~%" *log-path*)
 

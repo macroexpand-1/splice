@@ -187,7 +187,7 @@
        (splice-default-locked ps default cause)))))
 
 (defun abandon-decision-locked (ps decision choice)
-  "Audit a choice that came after somethign else moved PS"
+  "Audit a choice that came after something else moved PS"
   (audit :decision-abandoned
          :patch-set (patch-set-name ps)
          :point (operator-decision-point decision)

@@ -230,11 +230,12 @@ terminal state once the workers stop."
              :wallclock-ms (round (* 1000 (- (get-internal-real-time) start))
                                   internal-time-units-per-second))))
       (unless quiet
-        (format t "~&  [~a seed=~a] ~a after ~a tasks (~ams)~@[ detection-n=~a~]~%"
+        (format t "~&  [~a seed=~a] ~a after ~a tasks (~ams)~a~%"
                 (or fault :clean) seed (session-result-final-state result)
                 (session-result-tasks-run result)
                 (session-result-wallclock-ms result)
-                (session-result-detection-observations result)))
+                (let ((n (session-result-detection-observations result)))
+                  (if (integerp n) (format nil " detection-n=~a" n) ""))))
       result)))
 
 ;;; ---------------------------------------------------------------------
@@ -242,17 +243,19 @@ terminal state once the workers stop."
 
 (defun detection-observations-from-audit (&optional (after-seq 0))
   "SPRT sample count at the rollback decision, read from audit log entries
-after AFTER-SEQ."
-  (when splice:*audit-log*
-    (let ((*package* (find-package :splice)))
-      (loop for line in (splice::audit-log-lines splice:*audit-log*)
-            for entry = (ignore-errors (read-from-string line))
-            when (and entry (<= (getf entry :seq 0) after-seq))
-              do (return nil)   ; lines are newest-first; past the session
-            when (and entry (eq (getf entry :event) :rollback-decision))
-              do (let ((trigger (getf entry :trigger)))
-                   (when (and (consp trigger) (eq (first trigger) :sprt-reject))
-                     (return (getf (second trigger) :n))))))))
+after AFTER-SEQ. Returns the count, :NO-LOG or :NO-SPRT-REJECT"
+  (if splice:*audit-log*
+      (let ((*package* (find-package :splice)))
+        (loop for line in (splice::audit-log-lines splice:*audit-log*)
+              for entry = (ignore-errors (read-from-string line))
+              when (and entry (<= (getf entry :seq 0) after-seq))
+                do (return :no-sprt-reject) ; lines are newest-first; past the session
+              when (and entry (eq (getf entry :event) :rollback-decision))
+                do (let ((trigger (getf entry :trigger)))
+                     (when (and (consp trigger) (eq (first trigger) :sprt-reject))
+                       (return (getf (second trigger) :n))))
+              finally (return :no-sprt-reject)))
+      :no-log))
 
 (defun compare-rollback-exactness (orders pre-snapshot ps)
   "Check rollback exactness: fdefinitions EQ the originals, the class shape

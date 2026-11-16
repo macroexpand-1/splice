@@ -101,17 +101,20 @@ reproducible from the log alone, because I'm paranoid"
           (min (control-ring-size ring) (1+ (control-ring-count ring))))))
 
 (defun control-failure-rate (ring &key (min-samples 30))
-  "Failure rate over the ring, or NIL if too few samples to trust."
+  "Failure rate over the ring or :TOO-FEW-SAMPLES"
   (sb-thread:with-mutex ((control-ring-lock ring))
     (let ((n (control-ring-count ring)))
-      (when (>= n min-samples)
-        (/ (loop for i from 0 below n
-                 count (aref (control-ring-outcomes ring) i))
-           (float n 1d0))))))
+      (if (>= n min-samples)
+          (/ (loop for i from 0 below n
+                   count (aref (control-ring-outcomes ring) i))
+             (float n 1d0))
+          :too-few-samples))))
 
 (defun control-latency-quantile (ring q &key (min-samples 30))
+  "Latency at quantile Q over the ring or :TOO-FEW-SAMPLES"
   (sb-thread:with-mutex ((control-ring-lock ring))
     (let ((n (control-ring-count ring)))
-      (when (>= n min-samples)
-        (let ((sorted (sort (subseq (control-ring-latencies ring) 0 n) #'<)))
-          (aref sorted (min (1- n) (floor (* q n)))))))))
+      (if (>= n min-samples)
+          (let ((sorted (sort (subseq (control-ring-latencies ring) 0 n) #'<)))
+            (aref sorted (min (1- n) (floor (* q n)))))
+          :too-few-samples))))

@@ -13,6 +13,7 @@
 
 (defun probe-one (x) x)
 (defun probe-two (a b) (list a b))
+(defun probe-keyed (x &key verbose) (list x verbose))
 
 (defun unreadable-probe ()
   "A two-argument function whose lambda list (debug 0) leaves unrecorded"
@@ -23,15 +24,42 @@
 ;;; ---------------------------------------------------------------------
 ;;; Declaration
 
-(test parse-arity
-  (flet ((arity (lambda-list) (multiple-value-list (splice::parse-arity lambda-list))))
-    (is (equal '(0 0) (arity '())))
-    (is (equal '(2 2) (arity '(a b))))
-    (is (equal '(1 3) (arity '(a &optional b c))))
-    (is (equal '(1 nil) (arity '(a &rest r))))
-    (is (equal '(0 nil) (arity '(&key k))))
-    (is (equal '(1 nil) (arity '(a &optional b &key k))))
-    (is (equal '(1 1) (arity '(a &aux (x 1)))))))
+(test parse-call-shape
+  (flet ((shape (lambda-list)
+           (let ((s (splice::parse-call-shape lambda-list)))
+             (list (splice::call-shape-min s) (splice::call-shape-positional s)
+                   (splice::call-shape-tail s) (splice::call-shape-key-names s)
+                   (splice::call-shape-other-keys s)))))
+    (is (equal '(0 0 :none () :rejected) (shape '())))
+    (is (equal '(2 2 :none () :rejected) (shape '(a b))))
+    (is (equal '(1 3 :none () :rejected) (shape '(a &optional b c))))
+    (is (equal '(1 1 :rest () :rejected) (shape '(a &rest r))))
+    (is (equal '(0 0 :keys (:k) :rejected) (shape '(&key k))))
+    (is (equal '(1 2 :keys (:k :j :named) :rejected)
+               (shape '(a &optional b &key k (j 1) ((:named n) 2 n-p)))))
+    (is (equal '(0 0 :keys (:k) :allowed) (shape '(&rest r &key k &allow-other-keys))))
+    (is (equal '(1 1 :none () :rejected) (shape '(a &aux (x 1)))))))
+
+(test call-shape-gaps
+  (flet ((gap (old new)
+           (splice::call-shape-gap (splice::parse-call-shape old)
+                                   (splice::parse-call-shape new))))
+    ;; covered
+    (is (eq :covers (gap '(a b) '(a b))))
+    (is (eq :covers (gap '(a b) '(a &optional b c))))
+    (is (eq :covers (gap '(a &key k) '(a &key k j))))
+    (is (eq :covers (gap '(a &key k) '(a &key &allow-other-keys))))
+    (is (eq :covers (gap '(a &key k) '(a &rest r))))
+    (is (eq :covers (gap '(a) '(a &key k))))
+    ;; refused
+    (is (stringp (gap '(a) '(a b))))
+    (is (stringp (gap '(a b c) '(a b))))
+    (is (stringp (gap '(a &rest r) '(a b c))))
+    (is (stringp (gap '(x &key verbose) '(x &key quiet))))
+    (is (stringp (gap '(a &key k &allow-other-keys) '(a &key k))))
+    (is (stringp (gap '(a &rest r) '(a &key k))))
+    (is (stringp (gap '(a &optional b) '(a &key k))))
+    (is (stringp (gap '(a &optional b &key k) '(a &key k))))))
 
 (test defpatch-set-rejects-an-unknown-clause-at-expansion
   (signals error
@@ -57,18 +85,15 @@
 ;;; Lambda lists
 
 (test lambda-list-of-agrees-with-sb-introspect
-  (let* ((probe (splice::make-patch-set :name 'arity-probe))
-         (cases (list #'probe-one
-                      #'probe-two
-                      (compile nil '(lambda (a &optional b) (list a b)))
-                      (funcall (compile nil '(lambda (x) (lambda (a b) (+ a b x)))) 1)
-                      #'print-object)))
+  (let ((cases (list #'probe-one
+                     #'probe-two
+                     (compile nil '(lambda (a &optional b) (list a b)))
+                     (funcall (compile nil '(lambda (x) (lambda (a b) (+ a b x)))) 1)
+                     #'print-object)))
     (dolist (f cases)
-      (is (equal (multiple-value-list
-                  (splice::parse-arity (splice::lambda-list-of f)))
-                 (multiple-value-list
-                  (splice::parse-arity (sb-introspect:function-lambda-list f))))
-          "arity of ~a" f))))
+      (is (equalp (splice::parse-call-shape (splice::lambda-list-of f))
+                  (splice::parse-call-shape (sb-introspect:function-lambda-list f)))
+          "call shape of ~a" f))))
 
 (test lambda-list-of-names-an-unreadable-lambda-list
   (is (eq :unknown (splice::lambda-list-of (unreadable-probe))))
@@ -117,6 +142,13 @@
     (let ((veto (register-veto (fn-patch-set 'arity-fewer 'probe-two
                                              (lambda (a) a)))))
       (is (eq :static-arity (splice:patch-vetoed-contract veto))))))
+
+(test new-code-dropping-a-keyword-is-vetoed
+  (with-patch-set-names (arity-keys)
+    (let ((veto (register-veto (fn-patch-set 'arity-keys 'probe-keyed
+                                             (lambda (x &key quiet) (list x quiet))))))
+      (is (eq :static-arity (splice:patch-vetoed-contract veto)))
+      (is (search ":VERBOSE" (splice:patch-vetoed-detail veto))))))
 
 (test new-code-with-an-unreadable-lambda-list-is-vetoed
   (with-patch-set-names (arity-unknown)
@@ -194,12 +226,12 @@
     (splice:register-patch-set ps)
     ps))
 
-(test passing-contracts-return-t
+(test passing-contracts-return-pass
   (with-patch-set-names (contracts-pass)
     (let ((ps (registered-with-contracts 'contracts-pass
                                          (contract 'one (lambda () t))
                                          (contract 'two (lambda () t)))))
-      (is (eq t (splice::run-contracts ps))))))
+      (is (eq :pass (splice::run-contracts ps))))))
 
 (test a-failing-pre-flight-contract-vetoes
   (with-patch-set-names (contracts-veto)
@@ -214,7 +246,8 @@
   (with-patch-set-names (contracts-runtime)
     (let ((ps (registered-with-contracts 'contracts-runtime
                                          (contract 'broken (lambda () nil)))))
-      (is (eq 'broken (splice::run-contracts ps :phase :runtime)))
+      (is (equal '(:fail broken)
+                 (multiple-value-list (splice::run-contracts ps :phase :runtime))))
       (is (eq :registered (splice:patch-set-state ps))))))
 
 (test contracts-run-outside-any-task

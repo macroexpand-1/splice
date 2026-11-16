@@ -47,7 +47,7 @@
 
 (test audit-without-a-log-is-a-no-op
   (let ((splice:*audit-log* nil))
-    (is (null (splice:audit :probe :n 1)))))
+    (is (eq :unlogged (splice:audit :probe :n 1)))))
 
 (test audit-returns-sequence-numbers
   (with-audit-log (path)
@@ -98,26 +98,107 @@
 (test an-untouched-chain-verifies
   (with-audit-log (path)
     (three-entry-log)
-    (is (equal '(t 3 nil) (multiple-value-list (splice:verify-audit-chain path))))))
+    (is (equal '(t 3 nil :intact) (multiple-value-list (splice:verify-audit-chain path))))))
 
 (test an-edited-entry-breaks-the-next-link
   (with-audit-log (path)
     (three-entry-log)
     (with-tampered-copy
-        path
-        (lambda (lines)
-          (list (first lines)
-                (uiop:frob-substrings (second lines) '(":N 2") ":N 9")
-                (third lines)))
+      path
+      (lambda (lines)
+        (list (first lines)
+              (uiop:frob-substrings (second lines) '(":N 2") ":N 9")
+              (third lines)))
       (lambda (copy)
-        (is (equal '(nil 2 3) (multiple-value-list (splice:verify-audit-chain copy))))))))
+        (is (equal '(nil 2 3 :hash-mismatch) (multiple-value-list (splice:verify-audit-chain copy))))))))
 
 (test a-deleted-entry-breaks-the-chain
   (with-audit-log (path)
     (three-entry-log)
     (with-tampered-copy path (lambda (lines) (list (first lines) (third lines)))
       (lambda (copy)
-        (is (equal '(nil 1 3) (multiple-value-list (splice:verify-audit-chain copy))))))))
+        (is (equal '(nil 1 3 :hash-mismatch) (multiple-value-list (splice:verify-audit-chain copy))))))))
+
+;;; ---------------------------------------------------------------------
+;;; Opening and resuming
+
+(test opening-an-existing-log-refuses-and-leaves-it-alone
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:close-audit-log)
+    (signals error (splice:open-audit-log path))
+    (is (= 1 (length (log-lines path))))))
+
+(test deleting-a-log-says-what-it-found
+  (with-temp-log-path (path)
+    (is (eq :absent (splice:delete-audit-log path)))
+    (splice:open-audit-log path)
+    (splice:close-audit-log)
+    (is (eq :deleted (splice:delete-audit-log path)))
+    (is (null (probe-file path)))))
+
+(test resuming-a-missing-log-starts-a-chain-with-a-boot
+  (with-temp-log-path (path)
+    (splice:resume-audit-log path)
+    (splice:close-audit-log)
+    (let ((entry (first (log-entries path))))
+      (is (eq :boot (getf entry :event)))
+      (is (= 1 (getf entry :seq)))
+      (is (string= "genesis" (getf entry :prev-hash)))
+      (is (string= splice::*boot-id* (getf entry :full-boot-id))))))
+
+(test resuming-continues-the-chain
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:audit :probe :n 2)
+    (splice:close-audit-log)
+    (splice:resume-audit-log path)
+    (splice:audit :probe :n 3)
+    (splice:close-audit-log)
+    (let ((entries (log-entries path)))
+      (is (equal '(1 2 3 4) (mapcar (lambda (e) (getf e :seq)) entries)))
+      (is (eq :boot (getf (third entries) :event))))
+    (is-true (splice:verify-audit-chain path))))
+
+(test resuming-refuses-a-broken-chain
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:close-audit-log)
+    (with-open-file (out path :direction :output :if-exists :append)
+      (write-line "(:SEQ 2 :PREV-HASH \"forged\" :EVENT :PROBE" out))
+    (signals error (splice:resume-audit-log path))))
+
+;;; ---------------------------------------------------------------------
+;;; Closing under writers
+
+(test auditing-a-closed-log-is-unlogged
+  (with-temp-log-path (path)
+    (let ((log (splice:open-audit-log path)))
+      (splice:close-audit-log)
+      (let ((splice:*audit-log* log))
+        (is (eq :unlogged (splice:audit :probe :n 1)))))))
+
+(defun audit-until-closed (log)
+  "Write 2000 entries to LOG from this thread. Count lands or (:ERROR text)"
+  (let ((splice:*audit-log* log))
+    (handler-case (loop repeat 2000 count (integerp (splice:audit :probe :n 1)))
+      (error (e) (list :error (princ-to-string e))))))
+
+(test closing-under-writers-loses-no-line-and-signals-nothing
+  (with-temp-log-path (path)
+    (let* ((log (splice:open-audit-log path))
+           (threads (loop repeat 4
+                          collect (sb-thread:make-thread
+                                   (lambda () (audit-until-closed log))))))
+      (sleep 0.005)
+      (splice:close-audit-log)
+      (let ((landed (mapcar #'sb-thread:join-thread threads)))
+        (is (every #'integerp landed))
+        (is (= (reduce #'+ landed) (length (log-lines path))))
+        (is-true (splice:verify-audit-chain path))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Reconstruction: the pure fold
@@ -159,16 +240,16 @@
   (let ((state (fold (registered 's :functions '(f g) :classes '(c))
                      (event :install 's))))
     (is (eq :staged (state-of state 's)))
-    (is (eq :shimmed (impl-of state 'f)))
-    (is (eq :shimmed (impl-of state 'g)))
-    (is (eq :union (shape-of state 'c)))))
+    (is (equal '(:shimmed s) (impl-of state 'f)))
+    (is (equal '(:shimmed s) (impl-of state 'g)))
+    (is (equal '(:union s) (shape-of state 'c)))))
 
 (test a-canary-transition-moves-only-the-set
   (let ((state (fold (registered 's :functions '(f))
                      (event :install 's)
                      (event :canary-transition 's :to :canary-25))))
     (is (eq :canary-25 (state-of state 's)))
-    (is (eq :shimmed (impl-of state 'f)))))
+    (is (equal '(:shimmed s) (impl-of state 'f)))))
 
 (test promotion-points-at-the-new-code
   (let ((state (fold (registered 's :functions '(f) :classes '(c))
@@ -176,15 +257,15 @@
                      (event :promotion 's))))
     (is (eq :promoted (state-of state 's)))
     (is (equal '(:new s) (impl-of state 'f)))
-    (is (eq :new (shape-of state 'c)))))
+    (is (equal '(:new s) (shape-of state 'c)))))
 
 (test rollback-restores-the-originals
   (let ((state (fold (registered 's :functions '(f) :classes '(c))
                      (event :install 's)
                      (event :rollback-complete 's))))
     (is (eq :rolled-back (state-of state 's)))
-    (is (eq :original (impl-of state 'f)))
-    (is (eq :original (shape-of state 'c)))))
+    (is (equal '(:original s) (impl-of state 'f)))
+    (is (equal '(:original s) (shape-of state 'c)))))
 
 (test only-a-veto-verdict-vetoes
   (is (eq :vetoed (state-of (fold (registered 's)
@@ -227,7 +308,7 @@
     (let ((state (splice:reconstruct-state path)))
       (is (eq :promoted (state-of state 'rs)))
       (is (equal '(:new rs) (impl-of state 'f)))
-      (is (eq :new (shape-of state 'c))))))
+      (is (equal '(:new rs) (shape-of state 'c))))))
 
 (test reconstruct-state-refuses-a-broken-chain
   (with-audit-log (path)
@@ -235,3 +316,100 @@
     (with-tampered-copy path (lambda (lines) (list (first lines) (third lines)))
       (lambda (copy)
         (signals error (splice:reconstruct-state copy))))))
+
+;;; ---------------------------------------------------------------------
+;;; Torn tails
+
+(defun write-probe-log (path count)
+  "A closed log at PATH holding COUNT :PROBE entries"
+  (splice:open-audit-log path)
+  (dotimes (i count) (splice:audit :probe :n i))
+  (splice:close-audit-log))
+
+(defun append-octets (path octets)
+  "Append OCTETS to the file at PATH, since a crash mid-write would leave them"
+  (with-open-file (out path :direction :output :if-exists :append
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+    (write-sequence(coerce octets '(vector (unsigned-byte 8))) out)))
+
+(defun torn-line-octets ()
+  "Start of an entry cut inside a two-octet character."
+  (concatenate '(vector (unsigned-byte 8))
+               (sb-ext:string-to-octets "(:SEQ 3 :TS \"caf" :external-format :utf-8)
+               (subseq (sb-ext:string-to-octets "é" :external-format :utf-8) 0 1)))
+
+(defun octet-length (path)
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (file-length in)))
+
+(test a-torn-last-line-is-reported-not-signaled
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (append-octets path (torn-line-octets))
+    (is (equal '(nil 2 3 :torn-tail)
+               (multiple-value-list (splice:verify-audit-chain path))))))
+
+(test an-unreadable-whole-line-is-not-a-torn-tail
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (with-open-file (out path :direction :output :if-exists :append)
+      (write-line "(:SEQ 3 :TS" out))
+    (is (equal '(nil 2 3 :unreadable)
+               (multiple-value-list (splice:verify-audit-chain path))))))
+
+(test resuming-cuts-a-torn-tail-audits-the-cut
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (let ((torn (torn-line-octets)))
+      (append-octets path torn)
+      (splice:resume-audit-log path)
+      (splice:close-audit-log)
+      (let ((cut (third (log-entries path))))
+        (is (eq :torn-tail (getf cut :event)))
+        (is (= 2 (getf cut :after-seq)))
+        (is (= (length torn) (getf cut :bytes)))
+        (is (string= (splice::sha256-octets-hex torn) (getf cut :sha256))))
+      (is (eq :boot (getf (fourth (log-entries path)) :event)))
+      (is-true (splice:verify-audit-chain path)))))
+
+(test resuming-completes-a-missing-newline
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (splice::truncate-file path (1- (octet-length path)))
+    (splice:resume-audit-log path)
+    (splice:close-audit-log)
+    (is (equal '(:probe :probe :boot)
+               (mapcar (lambda (e) (getf e :event)) (log-entries path))))
+    (is-true (splice:verify-audit-chain path))))
+
+(test resuming-refuses-an-unreadable-whole-line
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (with-open-file (out path :direction :output :if-exists :append)
+      (write-line "(:SEQ 3 :TS" out))
+    (signals error (splice:resume-audit-log path))))
+
+(test a-log-that-is-only-a-torn-line-resumes-at-genesis
+  (with-temp-log-path (path)
+    (append-octets path (torn-line-octets))
+    (splice:resume-audit-log path)
+    (splice:close-audit-log)
+    (let ((cut (first (log-entries path))))
+      (is (eq :torn-tail (getf cut :event)))
+      (is (= 0 (getf cut :after-seq)))
+      (is (string= "genesis" (getf cut :prev-hash))))
+    (is-true (splice:verify-audit-chain path))))
+
+(test the-chain-tail-passes-over-a-torn-last-line
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (let ((intact (multiple-value-list (splice::chain-tail path))))
+      (append-octets path (torn-line-octets))
+      (is (equal intact (multiple-value-list (splice::chain-tail path)))))))
+
+(test an-unverified-read-signals-on-a-torn-line
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (append-octets path (torn-line-octets))
+    (signals error (splice::map-audit-entries path nil :verify nil))))

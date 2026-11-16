@@ -50,10 +50,10 @@
   (confound-threshold 0.15)   ; control failure rate above this => FROZEN
   (runtime-contract-interval 200) ; run contracts every N canary observations
   (pinned-new 0) (pinned-old 0)   ; in-flight task counts, per route
-  (hard-trigger nil)          ; set by anomaly capture; forces rollback
+  (hard-trigger :unarmed)     ; set by anomaly capture; forces rollback
   (history '())               ; (state . timestamp) transitions, newest first
   (freeze-reason nil)
-  (last-reversal-report nil)  ; reversal counts from the last rollback
+  (last-reversal-report :not-rolled-back) ; reversal counts from the last rollback
   (sealed nil))               ; journal released; rollback no longer offered
 
 (defvar *patch-sets* (make-hash-table :test #'eq #+sbcl :synchronized #+sbcl t)
@@ -69,6 +69,13 @@
 (defun find-patch-set (name)
   (gethash name *patch-sets*))
 
+(defun resolve-patch-set (name-or-ps)
+  "The patch set NAME-OR-PS names. Signals UNKNOWN-PATCH-SET for a name
+nothing registered"
+  (cond ((patch-set-p name-or-ps) name-or-ps)
+        ((find-patch-set name-or-ps))
+        (t (error 'unknown-patch-set :name name-or-ps))))
+
 ;;; ---------------------------------------------------------------------
 ;;; Lifecycle state
 
@@ -77,14 +84,14 @@
 
 (defun arm-hard-trigger (ps trigger)
   "Arm PS's hard trigger unless one is already armed; the first cause wins."
-  (sb-ext:compare-and-swap (patch-set-hard-trigger ps) nil trigger))
+  (sb-ext:compare-and-swap (patch-set-hard-trigger ps) :unarmed trigger))
 
 (defun take-hard-trigger (ps)
-  "PS's armed trigger or NIL, leaving the slot clear."
+  "PS's armed trigger or :UNARMED, leaving the slot :UNARMED"
   (loop for seen = (patch-set-hard-trigger ps)
-        when (or (null seen)
-                 (eq   seen (sb-ext:compare-and-swap (patch-set-hard-trigger ps)
-                                                     seen nil)))
+        when (or (eq seen :unarmed)
+                 (eq seen (sb-ext:compare-and-swap (patch-set-hard-trigger ps)
+                                                   seen :unarmed)))
           return seen))
 
 (defun canary-stage-p (state)
