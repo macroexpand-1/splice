@@ -47,7 +47,7 @@
   (unless (zerop (sb-alien:alien-funcall
                   (sb-alien:extern-alien "fsync" (function sb-alien:int sb-alien:int))
                   fd))
-    (error "fsync of file desscriptor ~a failed" fd))
+    (error "fsync of file descriptor ~a failed" fd))
   fd)
 
 (defun fsync-stream (stream)
@@ -289,9 +289,10 @@ torn or still being written - chain continues."
 
 (defun entry-of-line (line)
   "The audit entry one log LINE holds, read the way that MAP-AUDIT-ENTRIES reads."
-  (let ((*read-eval* nil)
-        (*package* (find-package :splice)))
-    (read-from-string line)))
+  (with-standard-io-syntax
+    (let ((*read-eval* nil)
+          (*package* (find-package :splice)))
+      (read-from-string line))))
 
 (defun chain-tail (path)
   "Where the chain at PATH left off: last seq and the hash of the line it continues from"

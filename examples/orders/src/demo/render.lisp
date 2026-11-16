@@ -425,8 +425,25 @@ and red from it onwards. FIRST-BAD-SEQ is NIL for an intact chain"
                (set-text "reconstruction" reconstruction)))
 
 (defun chain-detail-text (result)
-  (if (getf result :ok)
-      (format nil "Hash chain intact over ~d entries" (getf result :entries))
-      (format nil "Chain breaks at seq ~d: entry ~d was changed (~d entries in the file)"
-              (getf result :break-seq) (getf result :first-bad-seq) (getf result :entries))))
+  "One line saying what RESULT, a plist from chain-result, found"
+  (destructuring-bind (&key reason entries break-seq first-bad-seq &allow-other-keys) result
+    (ecase reason
+      (:intact
+       (format nil "Hash chain intact over ~d entries" entries))
+      (:hash-mismatch
+       (format nil "Chain breaks at seq ~d: entry ~d was changed (~d entries in the file)"
+               break-seq first-bad-seq entries))
+      (:unreadable
+       (format nil "Entry ~d does not read (~d entries in the file)" break-seq entries))
+      (:torn-tail
+       (format nil "The last entry, ~d, was cut off mid-write (~d entries in the file)"
+               break-seq entries))
+      (:unanchored
+       (format nil "Chain intact over ~d entries, but no checkpoint says none are missing"
+               entries))
+      (:truncated
+       (format nil "Chain intact over ~d entries, but the checkpoint names an entry that is gone"
+               entries))
+      (:unreadable-checkpoint
+       (format nil "Chain intact over ~d entries, but its checkpoint does not read" entries)))))
 

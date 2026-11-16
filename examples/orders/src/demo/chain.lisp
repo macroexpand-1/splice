@@ -4,13 +4,29 @@
 
 (defun chain-result (path)
   "Does the log at PATH chains, how many entries it holds, and the first
-one to not trust"
-  (multiple-value-bind (ok verified break-seq) (splice:verify-audit-chain path)
+one to not trust. :REASON is VERIFY-AUDIT-CHAIN's reason"
+  (multiple-value-bind (ok verified break-seq reason) (splice:verify-audit-chain path)
     (declare (ignore verified))
     (list :ok ok
-          :entries (nth-value 1 (splice::map-audit-entries path nil :verify nil))
+          :reason reason
+          :entries (line-count path)
           :break-seq break-seq
-          :first-bad-seq (and break-seq (1- break-seq)))))
+          :first-bad-seq (first-bad-seq reason break-seq))))
+
+(defun line-count (path)
+  "How many lines the file at PATH holds, whether or not they read"
+  (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
+    (loop while (read-line in nil nil) count t)))
+
+(defun first-bad-seq (reason break-seq)
+  "The first entry not to trust, given VERIFY-AUDIT-CHAIN's REASON and BREAK-SEQ, or NIL.
+A hash mismatch at BREAK-SEQ means the entry before it was changed; a line that
+doesn't read is itself the bad entry; the anchor reasons name no entry"
+  (ecase reason
+    (:intact nil)
+    (:hash-mismatch (1- break-seq))
+    ((:unreadable :torn-tail) break-seq)
+    ((:unanchored :truncated :unreadable-checkpoint) nil)))
 
 (defun reconstruction-text (path)
   "One line saying whether state rebuilt from the log, at PATH, matches the live image"
