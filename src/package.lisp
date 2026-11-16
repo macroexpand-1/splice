@@ -28,7 +28,8 @@
    #:migration-journal-count #:reverse-migration-report
 
    ;; audit
-   #:open-audit-log #:resume-audit-log #:close-audit-log #:delete-audit-log
+   #:anchor-audit-log #:open-audit-log #:resume-audit-log
+   #:close-audit-log #:delete-audit-log
    #:audit #:*audit-log*
    #:verify-audit-chain #:reconstruct-state #:verify-reconstruction
 

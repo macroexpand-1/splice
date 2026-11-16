@@ -102,7 +102,7 @@ stage. Signals PATCH-VETOED, installing nothing, if any contract fails."
 (defun report-outcome (ps route failure-p latency-ms &key condition)
   "Fold one task outcome into PS's evaluator. Control (:old) outcomes feed
 the baseline; canary (:new) outcomes feed the SPRTs and may trigger a
-transition. Returns the action taken: :continue when nothing changed, else
+transition. Returns the action taken: :continue when nothing changed, otherwise
 :advanced, :promoting, :rolling-back or :frozen."
   (declare (ignorable condition))
   (with-set-lock (ps)
