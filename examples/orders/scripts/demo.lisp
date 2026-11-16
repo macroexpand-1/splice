@@ -21,7 +21,9 @@
 (asdf:load-asd (merge-pathnames "../splice-orders.asd" *load-truename*))
 (asdf:load-system "splice-orders")
 
-(defpackage :splice-demo (:use :cl :splice :splice-orders))
+(defpackage :splice-demo
+  (:use :cl)
+  (:local-nicknames (#:orders #:splice-orders)))
 (in-package :splice-demo)
 
 (defvar *log-path* (merge-pathnames "artifacts/demo-audit.log"
@@ -31,8 +33,8 @@
   (format t "~%~a~%~a~%" (apply #'format nil fmt args)
           (make-string 72 :initial-element #\-)))
 
-(delete-audit-log *log-path*)
-(open-audit-log *log-path*)
+(splice:delete-audit-log *log-path*)
+(splice:open-audit-log *log-path*)
 (format t "~%splice demo, audit log: ~a~%" *log-path*)
 
 ;;; ---------------------------------------------------------------------
@@ -40,57 +42,57 @@
 
 (headline "1. Splice in: clean patch, canary ramp 5% -> 25% -> 100% -> promoted")
 
-(let ((r (run-canary-session :fault nil :seed 1001 :quiet t)))
+(let ((r (orders:run-canary-session :fault nil :seed 1001 :quiet t)))
   (format t "final state: ~a after ~a tasks~%"
-          (session-result-final-state r) (session-result-tasks-run r))
+          (orders:session-result-final-state r) (orders:session-result-tasks-run r))
   (format t "lifecycle:   ~{~a~^ -> ~}~%"
-          (mapcar #'car (session-result-transitions r)))
+          (mapcar #'car (orders:session-result-transitions r)))
   ;; the patched world is live: order math is exact minor units now
-  (let ((o (make-instance 'order :id 9999 :item-count 3 :unit-price 19.99
-                                 :discount-code "TEN")))
-    (with-task (:id 999999)
-      (process-order o)
+  (let ((o (make-instance 'orders:order :id 9999 :item-count 3 :unit-price 19.99
+                                        :discount-code "TEN")))
+    (splice:with-task (:id 999999)
+      (orders:process-order o)
       (format t "post-promotion order total: ~a cents (exact rational math)~%"
-              (order-cents o)))))
+              (orders:order-cents o)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Splice out
 
 (headline "2. Splice out: latent fault caught mid-ramp, fully reverted")
 
-(format t "fault: ~a~%~%" (fault-description :latent))
-(let ((r (run-canary-session :fault :latent :seed 2002 :quiet t)))
+(format t "fault: ~a~%~%" (orders:fault-description :latent))
+(let ((r (orders:run-canary-session :fault :latent :seed 2002 :quiet t)))
   (format t "final state: ~a after ~a tasks~%"
-          (session-result-final-state r) (session-result-tasks-run r))
+          (orders:session-result-final-state r) (orders:session-result-tasks-run r))
   (format t "lifecycle:   ~{~a~^ -> ~}~%"
-          (mapcar #'car (session-result-transitions r)))
+          (mapcar #'car (orders:session-result-transitions r)))
   (format t "SPRT rejected after ~a canary observations~%"
-          (session-result-detection-observations r))
-  (format t "reverse migration: ~a~%" (session-result-reversal-report r))
+          (orders:session-result-detection-observations r))
+  (format t "reverse migration: ~a~%" (orders:session-result-reversal-report r))
   (format t "rollback exactness: ~a~%"
-          (session-result-post-rollback-comparison r)))
+          (orders:session-result-post-rollback-comparison r)))
 
 ;; show that old behavior is genuinely back
-(let ((o (make-instance 'order :id 10000 :item-count 3 :unit-price 19.99
-                               :discount-code "TEN")))
-  (with-task (:id 1000000)
-    (process-order o)
+(let ((o (make-instance 'orders:order :id 10000 :item-count 3 :unit-price 19.99
+                                      :discount-code "TEN")))
+  (splice:with-task (:id 1000000)
+    (orders:process-order o)
     (format t "post-rollback order total: $~,2f (float world restored; ~
 class has no minor-units slot: ~a)~%"
-            (order-float-total o)
-            (not (slot-exists-p o 'splice-orders::amount-minor-units)))))
+            (orders:order-float-total o)
+            (not (slot-exists-p o 'orders::amount-minor-units)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Trace the splices
 
 (headline "3. Trace the splices: the audit log is the source of truth")
 
-(close-audit-log)
+(splice:close-audit-log)
 
-(multiple-value-bind (ok entry-count) (verify-audit-chain *log-path*)
+(multiple-value-bind (ok entry-count) (splice:verify-audit-chain *log-path*)
   (format t "hash chain intact over ~a entries: ~a~%" entry-count ok))
 
-(multiple-value-bind (ok mismatches state) (verify-reconstruction *log-path*)
+(multiple-value-bind (ok mismatches state) (splice:verify-reconstruction *log-path*)
   (declare (ignore state))
   (format t "state reconstructed from log matches live image: ~a~a~%"
           ok (if mismatches (format nil " (~a)" mismatches) "")))
@@ -106,7 +108,7 @@ class has no minor-units slot: ~a)~%"
                                (substitute #\9 #\1 line :count 1)
                                line)
                            out))))
-  (multiple-value-bind (ok entry-count break-seq) (verify-audit-chain tampered)
+  (multiple-value-bind (ok entry-count break-seq) (splice:verify-audit-chain tampered)
     (declare (ignore entry-count))
     (format t "tampered copy detected: intact=~a, chain breaks at seq ~a~%"
             ok break-seq)))

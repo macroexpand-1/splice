@@ -21,6 +21,7 @@
     (unwind-protect
          (progn
            (is (eq :session-running (d:start-act 1 '())))
+           (is (eq thread d::*session-thread*))
            (is (eq recorder d::*recorder*))
            (is (eq act d:*current-act*))
            (is (eq :session-running (d:reset-between-acts)))

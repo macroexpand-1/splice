@@ -414,6 +414,12 @@
     (append-octets path (torn-line-octets))
     (signals error (splice::map-audit-entries path nil :verify nil))))
 
+(test an-entry-reads-the-same-under-any-reader-settings
+  (let ((line (with-standard-io-syntax (prin1-to-string (list :seq 10 :llr 1.5)))))
+    (let ((*read-base* 16)
+          (*read-default-float-format* 'double-float))
+      (is (equal (list :seq 10 :llr 1.5) (splice::entry-of-line line))))))
+
 ;;; ---------------------------------------------------------------------
 ;;; Durability and the checkpoint
 
@@ -445,7 +451,7 @@
     (is (equal '(t 3 nil :intact)
                (multiple-value-list (splice:verify-audit-chain path))))))
 
-(test a-log-with-out-its-checkpoint-is-unanchored-until-anchored
+(test a-log-without-its-checkpoint-is-unanchored-until-anchored
   (with-temp-log-path (path)
     (write-probe-log path 3)
     (delete-file (splice::checkpoint-path path))
