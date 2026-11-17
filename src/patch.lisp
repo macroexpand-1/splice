@@ -67,7 +67,8 @@ OTHER-KEYS is :ALLOWED)."
 
 (defmacro defpatch-set (name (&key description ticket (ramp ''(5 25 100))
                                 paired-fallback (alpha 0.01d0) (beta 0.05d0)
-                                (sprt-min-n 50) (sprt-max-n 2000))
+                                (sprt-min-n 50) (sprt-max-n 2000)
+                                (stage-limit 40000))
                         &body clauses)
   "Declare a coherent patch set. Clauses:
   (:function name lambda-form)
@@ -81,6 +82,7 @@ OTHER-KEYS is :ALLOWED)."
                     :ramp ,ramp :paired-fallback ,paired-fallback
                     :alpha ,alpha :beta ,beta
                     :sprt-min-n ,sprt-min-n :sprt-max-n ,sprt-max-n
+                    :stage-limit ,stage-limit
                     :fn-patches (list ,@(clause-forms :function clauses))
                     :method-patches (list ,@(clause-forms :method clauses))
                     :class-patches (list ,@(clause-forms :class clauses))
@@ -382,6 +384,7 @@ and answered by calling RUN-OLD instead."
   (handler-case (funcall run-new)
     ((or error storage-condition) (e)
       (note-anomaly ps e)
+      (note-fallback ps)
       (funcall run-old))))
 
 (defun call-new (ps run-new run-old)

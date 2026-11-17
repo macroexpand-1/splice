@@ -40,18 +40,20 @@
   (ramp '(5 25 100))
   (state :registered)
   (current-fraction 0)
-  (stage-index -1)            ; index into RAMP; -1 = not yet canarying
+  (stage-index -1)                     ; index into RAMP; -1 = not yet canarying
   (lock (sb-thread:make-mutex))
-  (paired-fallback nil)       ; opt-in
+  (paired-fallback nil)                 ; opt-in
   (alpha 0.01d0) (beta 0.05d0)
   (sprt-min-n 50) (sprt-max-n 2000)
-  sprt-error sprt-latency     ; per-stage tests, reset on stage entry
+  (stage-limit 40000)
+  (stage-observations 0)
+  sprt-error sprt-latency               ; per-stage tests, reset on stage entry
   control-ring
-  (confound-threshold 0.15)   ; control failure rate above this => FROZEN
-  (runtime-contract-interval 200) ; run contracts every N canary observations
-  (pinned-new 0) (pinned-old 0)   ; in-flight task counts, per route
-  (hard-trigger :unarmed)     ; set by anomaly capture; forces rollback
-  (history '())               ; (state . timestamp) transitions, newest first
+  (confound-threshold 0.15)          ; control failure rate above this => FROZEN
+  (runtime-contract-interval 200)    ; run contracts every N canary observations
+  (pinned-new 0) (pinned-old 0)      ; in-flight task counts, per route
+  (hard-trigger :unarmed)            ; set by anomaly capture; forces rollback
+  (history '())                  ; (state . timestamp) transitions, newest first
   (freeze-reason nil)
   (last-reversal-report :not-rolled-back) ; reversal counts from the last rollback
   (sealed nil))               ; journal released; rollback no longer offered
