@@ -90,3 +90,31 @@
 (test name-of-tolerates-a-missing-set
   (is (string= "<none>" (splice::name-of nil)))
   (is (eq 'pin-probe (splice::name-of (set-in :staged)))))
+
+;;; ---------------------------------------------------------------------
+;;; Scoring a task
+;;; A fallback is a failure of the new route, even though the task answered.
+
+(test a-fallback-answers-with-old-code-and-is-marked
+  (let ((ps (set-in :canary-5 :fraction 5))
+        (splice::*task-id* 1)
+        (splice::*task-anomaly-noted* '()))
+    (is (eq :old-answer (splice::call-new-falling-back
+                         ps
+                         (lambda () (error "new code broke"))
+                         (lambda () :old-answer))))
+    (is-true (splice::fell-back-p ps))))
+
+(test an-error-new-code-recovered-from-is-not-a-fallback
+  (let ((ps (set-in :canary-5 :fraction 5))
+        (splice::*task-id* 1)
+        (splice::*task-anomaly-noted* '()))
+    (splice::note-anomaly ps (make-condition 'simple-error :format-control "caught"))
+    (is-false (splice::fell-back-p ps))))
+
+(test a-fallback-fails-the-new-pin-only
+  (let* ((ps (set-in :canary-5 :fraction 5))
+         (splice::*task-anomaly-noted* (list (cons ps :fell-back))))
+    (is-true (splice::pin-failed-p (list ps :new) :success))
+    (is-false (splice::pin-failed-p (list ps :old) :success))
+    (is-true (splice::pin-failed-p (list ps :old) :failure))))
