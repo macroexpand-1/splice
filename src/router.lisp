@@ -8,8 +8,9 @@
 (defvar *task-epochs* nil
   "List of (patch-set route) pins made at task entry.")
 (defvar *task-anomaly-noted* nil
-  "Alist (patch-set . t) of sets whose anomaly this task already recorded,
-so an error unwinding through nested shims counts once.")
+  "Alist (patch-set . t) of sets whose anomaly this task already recorded.
+Error that undwinds through nested shims counts once.
+:FELL-BACK means the set's new code failed and old code answered instead")
 (defvar *task-counter-cell* (list 0)
   "Task ids handed out so far. A cons for ATOMIC-INCF.")
 (defvar *task-sample-every* 50
@@ -60,7 +61,7 @@ Asked for Inline since every shim call asks it"
   "Record an error from :new-routed code, once per task per set. Storage
 conditions and migration failures arm the hard trigger."
   (unless (assoc ps *task-anomaly-noted* :test #'eq)
-    (push (cons ps t) *task-anomaly-noted*)
+    (push (cons ps :noted) *task-anomaly-noted*)
     (signal 'canary-anomaly :patch-set ps :task *task-id* :cause condition)
     (audit :canary-anomaly
            :patch-set (patch-set-name ps) :task *task-id*
@@ -72,6 +73,22 @@ conditions and migration failures arm the hard trigger."
                                    :storage-condition
                                    :migration-failure)
                                (princ-to-string condition)))))
+
+(defun note-fallback (ps)
+  "Mark PS as fallen back for the task. NOTE-ANOMALY has already recorded the error
+so the entry exists"
+  (setf (cdr (assoc ps *task-anomaly-note* :test #'eq)) :fell-back))
+
+(defun fell-back-p (ps)
+  "True when this task's new code for PS failed and old code answered"
+  (eq :fell-back (cdr (assoc ps *task-anomaly-noted* :test #'eq))))
+
+(defun pin-failed-p (pin outcome)
+  "True when the task failed on PIN's route: it raise or its new code fell back
+Fallback counts against :NEW only"
+  (destructring-bind (ps route) pin
+                     (or (eq outcome :failure)
+                         (and (eq route :new) (fell-back-p ps)))))
 
 (defun call-with-task (id thunk &key (swallow-errors nil))
   "Run THUNK as one task: pin routes, count in-flight tasks, and report the
@@ -119,7 +136,7 @@ on old code."
       (let ((latency-ms (/ (* 1000.0 (- (get-internal-real-time) start))
                            internal-time-units-per-second)))
         (dolist (pin *task-epochs*)
-          (report-outcome (car pin) (cadr pin) (eq outcome :failure) latency-ms
+          (report-outcome (car pin) (cadr pin) (pin-failed-p pin outcome) latency-ms
                           :condition condition))))))
 
 (defmacro with-task ((&key id (swallow-errors nil)) &body body)

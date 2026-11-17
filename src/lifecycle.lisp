@@ -89,7 +89,8 @@ stage. Signals PATCH-VETOED, installing nothing, if any contract fails."
   "Enter ramp stage INDEX. Caller holds the lock."
   (let ((fraction (nth index (patch-set-ramp ps))))
     (setf (patch-set-stage-index ps) index
-          (patch-set-current-fraction ps) fraction)
+          (patch-set-current-fraction ps) fraction
+          (patch-set-stage-observations ps) 0)
     (fresh-stage-sprts ps)
     (transition ps (stage-keyword fraction)
                 :fraction fraction
@@ -142,6 +143,7 @@ too degraded for any canary verdict to mean something. Caller holds the lock"
 
 (defun evaluate-canary-observation (ps failure-p latency-ms)
   "Caller holds the lock; hard triggers were already checked upstream."
+  (incf (patch-set-stage-observations ps))
   (let* ((err-sprt (patch-set-sprt-error ps))
          (lat-sprt (patch-set-sprt-latency ps))
          (ring (patch-set-control-ring ps))
@@ -165,29 +167,17 @@ too degraded for any canary verdict to mean something. Caller holds the lock"
                                     (list :runtime-contract failing))))))
     (cond
       ;; either stream rejecting is a rollback
-      ((or (eq err-verdict :reject) (eq lat-verdict :reject))
-       (let ((stream (if (eq err-verdict :reject) :errors :latency))
-             (sprt (if (eq err-verdict :reject) err-sprt lat-sprt)))
-         (defer (lambda () (signal 'canary-verdict :patch-set ps :stream-kind stream
-                                                   :direction :reject
-                                                   :n (sprt-n sprt) :llr (sprt-llr sprt))))
-         (settle-rollback-locked ps :sprt-reject
-                                 (list :sprt-reject (sprt-snapshot sprt stream)))))
-      ;; stage advances only when both streams accept health
-      ((and (eq err-verdict :accept) (eq lat-verdict :accept))
-       (defer (lambda () (signal 'canary-verdict :patch-set ps :stream-kind :both
-                                                 :direction :accept
-                                                 :n (sprt-n err-sprt) :llr (sprt-llr err-sprt))))
-       (if (< (1+ (patch-set-stage-index ps)) (length (patch-set-ramp ps)))
-           (settle-locked ps :sprt-accept :advance nil)
-           (settle-locked ps :sprt-accept :promote nil)))
-      ;; stage budget spent without a verdict: freeze, never promote silently
-      ((or (eq err-verdict :undecided) (eq lat-verdict :undecided))
-       (settle-locked ps :stage-timeout :freeze
+      ((stage-limit-reached-p ps)
+       (settle-locked ps :stage-tiemout :freeze
                       (list :stage-timeout
+                            :observations (patch-set-stage-observations ps)
+                            :limit (patch-set-stage-limit ps)
                             :errors (sprt-snapshot err-sprt :errors)
                             :latency (sprt-snapshot lat-sprt :latency))))
       (t :continue))))
+
+(defun stage-limit-reached-p (ps)
+  (>= (patch-set-stage-bservations ps) (patch-set-stage-limit ps)))
 
 (defun sprt-point (sprt)
   "SPRT's position as (n . llr). llr is a single float like SPRT-SNAPSHOT"
@@ -528,7 +518,7 @@ longer offered."
                 (null (set-exclusive-or (shape-slot-names cp shape) live)))
            :match)
           (t (list class-name :class-shape-mismatch shape
-                   :expected (shape-slot-names cp shape) :live live)))))
+                              :expected (shape-slot-names cp shape) :live live)))))
 
 (defun verify-reconstruction (path)
   "Reconstruct expected image state from the audit log at PATH and compare
