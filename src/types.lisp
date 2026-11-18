@@ -44,10 +44,9 @@
   (lock (sb-thread:make-mutex))
   (paired-fallback nil)                 ; opt-in
   (alpha 0.01d0) (beta 0.05d0)
-  (sprt-min-n 50) (sprt-max-n 2000)
+  (min-effect 0.3d0)
   (stage-limit 40000)
-  (stage-observations 0)
-  sprt-error sprt-latency               ; per-stage tests, reset on stage entry
+  (stage :none)
   control-ring
   (confound-threshold 0.15)          ; control failure rate above this => FROZEN
   (runtime-contract-interval 200)    ; run contracts every N canary observations

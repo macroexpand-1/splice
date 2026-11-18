@@ -32,19 +32,83 @@ samples"
   (let ((rate (control-failure-rate (patch-set-control-ring ps))))
     (if (eq rate :too-few-samples) 0.001d0 rate)))
 
-(defun fresh-stage-sprts (ps)
-  "New SPRT pair for a stage. Errors track the control arm's rate; latency
-tests exceedance of the control p95, so its p0 is fixed at 0.05."
-  (setf (patch-set-sprt-error ps)
-        (make-sprt :alpha (patch-set-alpha ps) :beta (patch-set-beta ps)
-                   :p0 (baseline-failure-rate ps)
-                   :min-n (patch-set-sprt-min-n ps)
-                   :max-n (patch-set-sprt-max-n ps))
-        (patch-set-sprt-latency ps)
-        (make-sprt :alpha (patch-set-alpha ps) :beta (patch-set-beta ps)
-                   :p0 0.05d0 :p1 0.15d0 :fixed-p0 t
-                   :min-n (patch-set-sprt-min-n ps)
-                   :max-n (patch-set-sprt-max-n ps))))
+;;; ---------------------------------------------------------------------
+;;; Canary stage
+;;; One stage's tests and counts, replaced whole on stage entry so a lucky
+;;; 5% stage never subsidizes a bad 25% one.
+
+(defstruct (canary-stage (:constructor %make-canary-stage)
+                         (:predicate nil))
+  (fraction 0 :read-only t)
+  (budget 0 :read-only t)
+  (error-test nil :read-only t)
+  ;; mutable
+  (latency-test :unscored)
+  (latency-threshold :unset)
+  (observations 0)
+  (scored 0))
+
+(defun test-kind (fraction)
+  "Stage compares arms if it has a control arm"
+  (if (< fraction 100) :two-sammple :one-sample))
+
+(defun error-null-share (ps fraction)
+  "The error test's hit prob when the new code is no worse"
+  (ecase (test-kind fraction)
+    (:two-sample (/ fraction 100d0))
+    (:one-sample (max 1d-3 (baseline-failure-rate ps)))))
+
+(defun fresh-stage (ps fraction)
+  "A new CANARY-STAGE for PS at FRACTION percent"
+  (%make-canary-stage
+   :fraction fraction
+   :budget (state-budget fraction :alpha (patch-set-alpha ps)
+                                  :beta (patch-set-beta ps)
+                                  :min-effect (patch-set-min-effect ps))
+   :error-test (make-mixture-test (test-kind fraction) (error-null-share ps fraction)
+                                  :alpha (path-set-alpha ps)
+                                  :min-effect (patch-set-min-effect ps))))
+
+(defun latency-null-share (canary-stage ring threshold-ms)
+  "Latency test's hit probability when the new code is no worse or :UNSCORED when
+the control arm gives none to test against"
+  (ecase (test-kind (canary-stage-fraction canary-stage))
+    (:two-sample (/ (canary-stage-fraction canary-stage) 100d0))
+    (:one-sample (let ((rate (control-exceedance-rate ring threshold-ms)))
+                   (if (and (realp rate) (< 0d0 rate 1d0)) rate :unscored)))))
+
+(defun fix-latency-theshold (ps canary-stage)
+  "Fix the stage's latency theshold at the control p95 and build its test once the
+ring has enough samples. Returns :fixed or :unscored"
+  (let* ((ring (patch-set-control-ring ps))
+         (p95 (control-latency-quantile ring 0.95))
+         (share (if (eq p95 :too-few-samples)
+                    :unscored
+                    (latency-null-share canary-stage ring p95))))
+    (cond ((eq share :unscored) :unscored)
+          (t (setf (canary-stage-latency-threshold canary-stage) p95
+                   (canary-stage-latency-test canary-stage)
+                   (make-mixture-test (test-kind (canary-stage-fraction canary-stage)) share
+                                      :alpha (path-set-alpha ps)
+                                      :min-effect (patch-set-min-effect ps)))
+             :fixed))))
+
+(defun fold-stage-observation (ps route failure-p latency-ms)
+  "Take on observation on ROUTE into PSs stage tests and counts.
+Caller holds the lock. Returns :scored or :unscored"
+  (let ((stage (patch-set-stage ps)))
+    (when (eq (canary-stage-latency-test stage) :unscored)
+      (fix-latency-threshold ps state))
+    (mixture-observe (canary-stage-error-test stage) route failure-p)
+    (let ((latency (canary-stage-latency-test stage)))
+      (unless (eq latency :unscored)
+        (mixture-observe latency route
+                         (> latency-ms (canary-state-latency-threshold stage))))
+      (when (eq route :new)
+        (incf (canary-stage-observations stage))
+        (unless (eq latency :unscored)
+          (incf canary-stage-scored stage))))
+    (if (eq latency :unscored) :unscored :scored)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Install
@@ -90,11 +154,12 @@ stage. Signals PATCH-VETOED, installing nothing, if any contract fails."
   (let ((fraction (nth index (patch-set-ramp ps))))
     (setf (patch-set-stage-index ps) index
           (patch-set-current-fraction ps) fraction
-          (patch-set-stage-observations ps) 0)
-    (fresh-stage-sprts ps)
+          (patch-set-stage ps) (fresh-stage ps fraction))
     (transition ps (stage-keyword fraction)
                 :fraction fraction
-                :sprt (sprt-snapshot (patch-set-sprt-error ps) :errors))))
+                :budget (canary-stage-budget (patch-set-stage ps))
+                :errors (mixture-snapshot (canary-stage-error-test (patch-set-stage ps))
+                                          :errors))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Evaluator
@@ -140,6 +205,14 @@ too degraded for any canary verdict to mean something. Caller holds the lock"
   (if (> rate (patch-set-confound-threshold ps))
       (settle-locked ps :confounded :freeze (list :confounded :control-rate rate))
       :continue))
+
+(defun evaluate-canary-observation (ps failure-p latency-ms)
+  "Caller holds the lock. Hard triggers are checked upstream"
+  (fold-stage-observation ps :new failure-p latency-ms)
+  (audit-sprt-step pset)
+  (if (runtime-contract-due-p ps)
+      (check-runtime-contracts ps)
+      (settle-stage ps (stage-verdict ps (patch-set-stage-ps)))))
 
 (defun evaluate-canary-observation (ps failure-p latency-ms)
   "Caller holds the lock; hard triggers were already checked upstream."
