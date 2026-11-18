@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs every check CI runs before a push goes out. Enable once per clone with
+#   git config core.hooksPath .githooks
+# and skip a single push with git push --no-verify.
+exec sbcl --non-interactive --load test/check.lisp

@@ -5,8 +5,8 @@
 the reversible class migration, and the hash-chained log. Very specifically loads no SBCL contribs."
   :author "splice project"
   :license "MIT"
-  :serial t
   :components ((:module "src"
+                :serial t
                 :components ((:file "package")
                              (:file "sha256")
                              (:file "types")
@@ -26,8 +26,8 @@ the member. No transport, so like splice it loads no SBCL contribs."
   :author "splice project"
   :license "MIT"
   :depends-on ("splice")
-  :serial t
   :components ((:module "src"
+                :serial t
                 :components ((:file "cluster-package")
                              (:file "cluster-protocol"))))
   :in-order-to ((test-op (test-op "splice/cluster-tests"))))
@@ -44,8 +44,8 @@ the member. No transport, so like splice it loads no SBCL contribs."
 (defsystem "splice/tests"
   :description "Unit tests. Fast enough to run on every change."
   :depends-on ("splice" "fiveam" "sb-introspect")
-  :serial t
   :components ((:module "test/unit"
+                :serial t
                 :components ((:file "package")
                              (:file "sha256")
                              (:file "sprt")
@@ -83,8 +83,8 @@ rollback and promotion threads, and one conductor and member in this image.
 Slower than the unit suite, so (asdf:test-system \"splice\") leaves them out.
 Shares the unit suite's package and fixtures."
   :depends-on ("splice/cluster-tests" "fiveam")
-  :serial t
   :components ((:module "test/integration"
+                :serial t
                 :components ((:file "fixtures")
                              (:file "lifecycle")
                              (:file "decisions")
