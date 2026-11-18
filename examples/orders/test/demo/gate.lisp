@@ -19,3 +19,11 @@
     (d:open-gate gate :next-stage)
     (mapc #'sb-thread:join-thread waiters)
     (is (= 2 (car passed)))))
+
+(test a-released-gate-lets-every-wait-through
+  (let* ((gate (d:make-gate))
+         (waiter (sb-thread:make-thread (lambda () (d:await-gate gate :release-held)))))
+    (is (eq :released (d:release-gate gate)))
+    (is (eq :release-held (sb-thread:join-thread waiter :timeout 2 :default :timed-out)))
+    (is (eq :next-stage (d:await-gate gate :next-stage)))
+    (is (eq :next-stage (d:await-gate gate :next-stage)))))

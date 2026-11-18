@@ -144,12 +144,24 @@ Returns the copy's chain-result plist, or what stop-frame-sources said when it d
 ;;; Replay
 
 (defun switch-to-replay (path)
-  "Replace live frames with the recording at PATH. Returns :started, the status that refused
-the recording, or :sampler-stuck / :player-stuck."
-  (multiple-value-bind (status header snapshots) (d:load-recording path)
+  "Replace live frames with the recording at PATH. On stage a recording made at another
+commit still plays, with a warning. Returns :started, the status that refused the
+recording, or :sampler-stuck / :player-stuck."
+  (multiple-value-bind (status header snapshots) (d:load-recording path :commit nil)
     (if (eq status :loaded)
-        (play-instead header snapshots)
+        (progn (warn-on-other-commit path header)
+               (play-instead header snapshots))
         status)))
+
+(defun warn-on-other-commit (path header)
+  "Warn when the recording at PATH was made at a commit other than this checkout's.
+Returns :same-commit or :other-commit"
+  (let ((recorded (getf header :splice-commit))
+        (current (d:splice-commit)))
+    (if (equal recorded current)
+        :same-commit
+        (progn (warn "recording ~a was made at ~a; this checkout is ~a" path recorded current)
+               :other-commit))))
 
 (defun play-instead (header snapshots)
   "Stop every live frame source, then play SNAPSHOTS into the page."

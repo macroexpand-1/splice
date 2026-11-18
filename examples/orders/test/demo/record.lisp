@@ -163,6 +163,10 @@
       (is (stringp (first after-failure)))
       (is (null after-success)))))
 
+(defun without-sprt-points (snapshots)
+  "SNAPSHOTS with every SPRT walk empty, as a recording that caught no SPRT step"
+  (map 'vector (lambda (snapshot) (list* :sprt '() snapshot)) snapshots))
+
 (test the-checker-matches-its-log
   "A seed 2002 session recorded through a sampler, checked against its own log."
   (with-demo-log (path)
@@ -179,6 +183,7 @@
              (let ((snapshots (nth-value 2 (d:load-recording recording :commit nil))))
                (is (eq :consistent (d:check-recording snapshots path)))
                (is (eq :inconsistent (d:check-recording (with-one-llr-changed snapshots) path)))
+               (is (eq :no-points (d:check-recording (without-sprt-points snapshots) path)))
                (is (eq :broken-log (d:check-recording snapshots (d:tamper-copy path))))))
         (setf splice::*audit-sprt-steps* steps)
         (uiop:delete-file-if-exists recording)))))

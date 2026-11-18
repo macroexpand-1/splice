@@ -5,7 +5,7 @@
   (:local-nicknames (#:orders #:splice-orders))
   (:export
    ;; the snapshot contract
-   #:+snapshot-version+ #:*current-act*
+   #:+snapshot-version+ #:*current-act* #:*act-outcome*
    #:empty-snapshot #:next-snapshot #:snapshot-get
    #:write-snapshot #:read-snapshot #:read-all-snapshots
 
@@ -15,7 +15,7 @@
    ;; renderers and the presenter gate
    #:render-frame #:chain-strip-svg #:js-string #:*palette*
    #:page-html #:page-script
-   #:gate #:make-gate #:open-gate #:await-gate
+   #:gate #:make-gate #:open-gate #:await-gate #:release-gate
 
    ;; the audit chain strip
    #:chain-result #:chain-check-js #:reconstruction-text #:tamper-copy
@@ -23,9 +23,9 @@
    ;; recording and replay
    #:make-recorder #:load-recording #:replay-recording
    #:start-player #:stop-player #:jump-player #:pause-player
-   #:check-recording
+   #:check-recording #:splice-commit
 
    ;; the act driver
    #:*gate* #:*demo-log-path*
-   #:start-act #:run-act #:reset-between-acts
+   #:start-act #:run-act #:stop-act #:reset-between-acts
    #:start-recording #:stop-recording #:restart-sampler))

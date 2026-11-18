@@ -14,6 +14,11 @@
 (defvar *current-act* nil
   "The act on screen for the snapshot's :session. Set by the act driver")
 
+(defvar *act-outcome* :none
+  "How the current or last act's session ended: :none before the first act, :running,
+:finished, or the fault string of the error that ended it. Set by the act driver;
+the sampler shows a crash in every frame's faults")
+
 (defun snapshot-get (snapshot field)
   "FIELD of SNAPSHOT. It signals on the field the contract doesn't have so it
 fails loudly instead of reading NIL"
