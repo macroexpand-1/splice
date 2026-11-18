@@ -8,8 +8,8 @@ rational minor units, and the session driver that runs it under canary."
   :author "splice project"
   :license "MIT"
   :depends-on ("splice")
-  :serial t
   :components ((:module "src"
+                :serial t
                 :components ((:file "package")
                              (:file "app")
                              (:file "flagship")
@@ -37,8 +37,8 @@ artifacts/criteria-report.md with the measured numbers."
 (defsystem "splice-orders/tests"
   :description "The example's tests: the observer hooks the demo uses."
   :depends-on ("splice-orders" "fiveam")
-  :serial t
   :components ((:module "test"
+                :serial t
                 :components ((:file "package")
                              (:file "hooks"))))
   :perform (test-op (o c)
@@ -65,8 +65,8 @@ Runs before and demo code exists"
   :description "The live-image demo: snapshots, the sampler, renderers, the
 presenter gate, recording and the act driver. Everything testable without a browser."
   :depends-on ("splice-orders")
-  :serial t
   :components ((:module "src/demo"
+                :serial t
                 :components ((:file "package")
                              (:file "snapshot")
                              (:file "sampler")
@@ -80,8 +80,8 @@ presenter gate, recording and the act driver. Everything testable without a brow
 (defsystem "splice-orders/demo-tests"
   :description "Demo tests. Runs without CLOG installed."
   :depends-on ("splice-orders/demo" "fiveam")
-  :serial t
   :components ((:module "test/demo"
+                :serial t
                 :components ((:file "package")
                              (:file "snapshot")
                              (:file "sampler")
