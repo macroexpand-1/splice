@@ -1,7 +1,10 @@
 name: ci
 
+# Pushes to main and pull requests. A push to a PR branch already runs through
+# pull_request, so a bare push trigger would run every check twice.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -65,53 +68,10 @@ jobs:
           EOF
           for archive in *.tgz; do tar -xzf "$archive"; done
 
-      - name: Unit tests
-        run: >
-          sbcl --non-interactive
-          --eval '(require :asdf)'
-          --eval '(asdf:load-asd (truename "splice.asd"))'
-          --eval '(asdf:test-system "splice")'
-
-      # The cluster protocol's unit tests. They open no socket, so they cover
-      # the protocol but not the TCP transport.
-      - name: Cluster tests
-        run: >
-          sbcl --non-interactive
-          --eval '(require :asdf)'
-          --eval '(asdf:load-asd (truename "splice.asd"))'
-          --eval '(asdf:test-system "splice/cluster")'
-
-      # Loading splice/cluster-tcp checks that the transport compiles, and that
-      # the protocol loads without the orders example.
-      - name: Cluster loads
-        run: >
-          sbcl --non-interactive
-          --eval '(require :asdf)'
-          --eval '(asdf:load-asd (truename "splice.asd"))'
-          --eval '(asdf:load-system "splice/cluster-tcp")'
-
-      # The demo rewrites examples/orders/artifacts/demo-audit.log, which is
-      # tracked. That is harmless in a throwaway checkout, but a step added later
-      # that checks for a clean tree has to run before this one or restore the file.
-      - name: Demo
-        run: sbcl --non-interactive --load examples/orders/scripts/demo.lisp
-
-      # SPLICE_RUNS=20 is the quick run (about 15 seconds locally); drop it for
-      # the full 100 per fault class (about 2 to 4 minutes).
-      #
-      # C7 is a timing check: the canary shim must cost under 2x a plain call
-      # (1.37x locally). Shared runners are noisy, so it is the likeliest flake.
-      # If it fails intermittently, loosen the threshold for CI rather than
-      # changing the code.
-      - name: Criteria
-        env:
-          SPLICE_RUNS: "20"
-        run: >
-          sbcl --non-interactive
-          --eval '(require :asdf)'
-          --eval '(asdf:load-asd (truename "splice.asd"))'
-          --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))'
-          --eval '(asdf:test-system "splice-orders/criteria")'
+      # Every suite, the demo and the full criteria run, each in a fresh SBCL.
+      # The pre-push hook runs the same file, so the list lives there.
+      - name: Checks
+        run: sbcl --non-interactive --load test/check.lisp
 
       - name: Upload criteria report
         if: always()
