@@ -55,13 +55,16 @@ recordings/act-2-seed-2002-20261028T170211.sexp in placed in the example's tree.
     (error () "unknown")))
 
 ;;; TODO - Rework this. I really hate a lot of this
-(defun recording-header (act settings)
-  "First line of recording of ACT run with SETTINGS.
-It's a plist of :seed :fault :threads :pre-existing"
+(defun recording-header (act settings log-path)
+  "First line of recording of ACT run with SETTINGS, written to the audit log at LOG-PATH.
+It's a plist of :seed :fault :threads :pre-existing, plus the log's path and this boot's id
+so a recording can be matched to its log"
   (list :recording 1
         :snapshot-version +snapshot-version+
         :splice-commit (splice-commit)
         :started (splice::timestamp-string)
+        :audit-log (and log-path (namestring log-path))
+        :boot-id splice::*boot-id*
         :act act
         :seed (getf settings :seed)
         :fault (getf settings :fault)
@@ -223,11 +226,14 @@ Returns :paused, :playing, or :no-player"
 
 (defun check-recording (snapshots audit-path)
   "Whether every SPRT point in SNAPSHOTS is an :sprt-step entry of AUDIT-PATH in the recording's
-seq range. Returns :consistent, :inconsistent or :broken-log."
+seq range. Returns :consistent, :inconsistent, :broken-log, or :no-points when the recording
+draws no SPRT point and so can't be checked against any log."
   (multiple-value-bind (ok logged) (sprt-points-in-log audit-path (seq-range snapshots))
-    (cond ((not ok) :broken-log)
-          ((subsetp (recorded-sprt-points snapshots) logged :test #'equal) :consistent)
-          (t :inconsistent))))
+    (let ((recorded (recorded-sprt-points snapshots)))
+      (cond ((not ok) :broken-log)
+            ((null recorded) :no-points)
+            ((subsetp recorded logged :test #'equal) :consistent)
+            (t :inconsistent)))))
 
 (defun seq-range (snapshots)
   "(start . end): the session's audit start seq and the last snapshot's :audit-seq."

@@ -46,7 +46,18 @@ pausing"
   (await-gate *gate* :release-held))
 
 (defun run-act (act)
-  "Run ACT's canary session in this thread. Drain timeout is set first."
+  "Run ACT's canary session in this thread and keep how it ended in *act-outcome*.
+Returns the session-result, or :crashed when the session signaled"
+  (setf *act-outcome* :running)
+  (handler-case (let ((result (run-act-session act)))
+                  (setf *act-outcome* :finished)
+                  result)
+    (error (e)
+      (setf *act-outcome* (fault-string "act crashed" e))
+      :crashed)))
+
+(defun run-act-session (act)
+  "Run ACT's canary session. Drain timeout is set first."
   (let ((settings (act-settings act)))
     (setf splice::*drain-timeout-seconds* (getf settings :drain))
     (orders:run-canary-session
@@ -56,7 +67,7 @@ pausing"
      :pre-existing (getf settings :pre-existing)
      :quiet t
      :pace (act-pace act)
-     :settle-timeout (+ (getf settings :drain) 30))))
+     :settle-timeout (act-settle-seconds act))))
 
 (defun session-alive-p ()
   "True as long as either the last act's session thread or held task is alive"
@@ -70,7 +81,7 @@ pausing"
   (let* ((settings (act-settings act))
          (path (recording-path act (getf settings :seed))))
     (multiple-value-bind (sink close)
-        (make-recorder path (recording-header act settings))
+        (make-recorder path (recording-header act settings *demo-log-path*))
       (setf *recorder* (list :path path :sink sink :close close))
       path)))
 
@@ -121,11 +132,35 @@ sources hav ejoined"
 (defun open-act (act sinks)
   (reset-between-acts)
   (let ((path (start-recording act)))
-    (setf *current-act* act)
+    (setf *current-act* act
+          *act-outcome* :running)
     (start-sampler (act-sinks sinks))
     (setf *session-thread*
           (sb-thread:make-thread (lambda () (run-act act)) :name "demo-session"))
     path))
+
+(defun stop-act ()
+  "Abandon the current act: release the gate so the pace and the held task stop waiting,
+let the session run out unpaced, then stop the sampler and close the recording.
+Returns the recording's path, :none when nothing was recording, :session-stuck when
+the session did not finish within its settle time, or :sampler-stuck"
+  (release-gate *gate*)
+  (if (eq :not-joined (join-session))
+      :session-stuck
+      (stop-recording)))
+
+(defun join-session ()
+  "Wait for the act's session thread, as long as its settle timeout.
+Returns :joined, :not-joined or :not-running"
+  (if (and *session-thread* (sb-thread:thread-alive-p *session-thread*))
+      (progn (sb-thread:join-thread *session-thread* :default :aborted
+                                                     :timeout (act-settle-seconds *current-act*))
+             (if (sb-thread:thread-alive-p *session-thread*) :not-joined :joined))
+      :not-running))
+
+(defun act-settle-seconds (act)
+  "How long ACT's session may take to settle once nothing holds it"
+  (+ (getf (act-settings act) :drain) 30))
 
 (defun restart-sampler (sinks)
   "Stop the player + samplelr, then sample again into the open recording and SINKS.

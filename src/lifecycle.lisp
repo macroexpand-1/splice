@@ -323,7 +323,7 @@ in :restoring, which an operator cannot move the set out of."
 
 (defun complete-promotion (ps)
   "Drain :old-pinned tasks, then claim the set and swap in the new world. Drain that times
-out freezes th set, so no :old task ever runs new code. Sets that leave :promoting
+out freezes the set, so no :old task ever runs new code. Sets that leave :promoting
 during the drain are left alone. Returns :promoted, :frozen, or :abandoned"
   (cond ((not (wait-for-drain (lambda () (patch-set-pinned-old ps))
                               *drain-timeout-seconds*))

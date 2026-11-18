@@ -392,6 +392,7 @@
 
 (test a-log-that-is-only-a-torn-line-resumes-at-genesis
   (with-temp-log-path (path)
+    (close (splice::open-checkpoint path 0 "genesis"))
     (append-octets path (torn-line-octets))
     (splice:resume-audit-log path)
     (splice:close-audit-log)
@@ -477,6 +478,31 @@
     (write-probe-log path 2)
     (delete-file path)
     (signals error (splice:resume-audit-log path))))
+
+(test a-deleted-log-with-its-checkpoint-left-refuses-to-open
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (delete-file path)
+    (signals error (splice:open-audit-log path))
+    (is (null (probe-file path)))
+    (is (= 2 (splice::read-checkpoint path)))))
+
+(test a-torn-line-the-checkpoint-covers-refuses-without-cutting
+  (with-temp-log-path (path)
+    (write-probe-log path 3)
+    (splice::truncate-file path (- (octet-length path) 2))
+    (let ((before (octet-length path)))
+      (signals error (splice:resume-audit-log path))
+      (is (= before (octet-length path))))))
+
+(test an-unanchored-torn-log-refuses-without-cutting
+  (with-temp-log-path (path)
+    (write-probe-log path 2)
+    (append-octets path (torn-line-octets))
+    (delete-file (splice::checkpoint-path path))
+    (let ((before (octet-length path)))
+      (signals error (splice:resume-audit-log path))
+      (is (= before (octet-length path))))))
 
 (test deleting-a-log-deletes-its-checkpoint
   (with-temp-log-path (path)

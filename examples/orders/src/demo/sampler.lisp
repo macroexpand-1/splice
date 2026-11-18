@@ -204,7 +204,7 @@ Then it's the second value from TAIL-STATUS"
                     :bounds (read-sprt-bounds ps)
                     :sprt-steps (sprt-steps entries (splice:patch-set-name ps))
                     :tail tail
-                    :faults faults)
+                    :faults (with-act-fault faults))
               (read-orders (orders:live-session-orders session))))))
 
 (defun frame-cursor (previous session)
@@ -220,6 +220,12 @@ and migrate it"
   "FAULTS with FAULT in front, keeping the newest *five*"
   (let ((all (cons fault faults)))
     (subseq all 0 (min 5 (length all)))))
+
+(defun with-act-fault (faults)
+  "FAULTS, with the fault that ended the act in front when its session crashed"
+  (if (stringp *act-outcome*)
+      (add-fault *act-outcome* faults)
+      faults))
 
 (defun fold-frame (previous session faults)
   "Snapshot after PREVIOUS or a fault string when the image could not be read.

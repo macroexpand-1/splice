@@ -79,7 +79,7 @@
   (fsync-stream stream))
 
 (defun open-checkpoint (path seq hash)
-  "Stream on a new checkpoint besie the log at PATH"
+  "Stream on a new checkpoint beside the log at PATH"
   (let ((stream (open (checkpoint-path path)  :direction :io
                                               :if-exists :overwrite
                                               :if-does-not-exist :create)))
@@ -94,6 +94,9 @@
 RESUME-AUDIT-LOG continues one"
   (when (probe-file path)
     (error "audit log ~a already exists; resume-audit-log continues it" path))
+  (when (probe-file (checkpoint-path path))
+    (error "audit log ~a is missing but its checkpoint is not; delete-audit-log starts over"
+           path))
   (let ((stream (open path :direction :output :if-exists :error
                            :if-does-not-exist :create)))
     (call-closing-on-error stream (lambda () (start-log path stream 0 "genesis")))))
@@ -269,7 +272,7 @@ REASON is MAP-AUDIT-ENTRIES or CHECK-ANCHOR's (when chain holds, checkpoint does
               (values nil count nil anchor))))))
 
 (defun last-two-lines (path)
-  "Last line of the file at PATH and the one before it. Eaach can be :EMPTY"
+  "Last line of the file at PATH and the one before it. Each can be :EMPTY"
   (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
     (loop with previous = :empty
           with last = :empty
@@ -311,7 +314,7 @@ torn or still being written - chain continues."
       :unreadable))
 
 (defun read-checkpoint (path)
-  "(values seq has) checkpointed beside the log at PATH. :ABSENT when no checkpoint,
+  "(values seq hash) checkpointed beside the log at PATH. :ABSENT when no checkpoint,
 :UNREADABLE when it doesn't parse"
   (let ((head (checkpoint-path path)))
     (if (probe-file head)
@@ -342,7 +345,7 @@ otherwise the next entry's :PREV-HASH. :MISSING when the log ends before SEQ"
                (file-length in)))))
 
 (defun check-anchor (path)
-  "Heat check the log at PATH. It can be :ANCHORED, :UNANCHORED (has a log w/ no checkpoint)
+  "Health check the log at PATH. It can be :ANCHORED, :UNANCHORED (has a log w/ no checkpoint)
 :TRUNCATED (checkpointed entry is gone/changed) or :UNREADABLE-CHECKPOINT"
   (multiple-value-bind (seq hash) (read-checkpoint path)
     (case seq
@@ -352,7 +355,7 @@ otherwise the next entry's :PREV-HASH. :MISSING when the log ends before SEQ"
 
 (defun anchor-audit-log (path)
   "Checkpoint the end of a log at PATH. This is for logs without a checkpoint that an operator
-vouches for. Refuses a chain that doesn't verify. Returns anochored seq"
+vouches for. Refuses a chain that doesn't verify. Returns anchored seq"
   (multiple-value-bind (ok count break-seq reason) (map-audit-entries path nil)
     (declare (ignore count))
     (unless ok
@@ -363,7 +366,7 @@ vouches for. Refuses a chain that doesn't verify. Returns anochored seq"
     seq))
 
 (defun last-newline-end (path)
-  "Octet offeset past the last newline in the file at PATH or 0"
+  "Octet offset past the last newline in the file at PATH or 0"
   (with-open-file (in path :element-type '(unsigned-byte 8))
     (loop for pos from (1- (file-length in)) downto 0
           do (file-position in pos)
@@ -390,7 +393,7 @@ vouches for. Refuses a chain that doesn't verify. Returns anochored seq"
           :sha256 (sha256-octets-hex octets))))
 
 (defun missing-final-newline-p (path)
-  "Tree when the file at PATH ends i a line with no newline"
+  "True when the file at PATH ends in a line with no newline"
   (with-open-file (in path :element-type '(unsigned-byte 8))
     (and (plusp (file-length in))
          (progn (file-position in (1- (file-length in)))
@@ -411,16 +414,32 @@ vouches for. Refuses a chain that doesn't verify. Returns anochored seq"
              path reason break-seq))
     :intact))
 
+(defun refuse-unanchored-tail (path)
+  "Signal unless the checkpoint of the log at PATH sits at or before its last whole entry.
+A checkpoint that covers the torn line means it was synced, so it is damage, not a crash.
+Returns :ANCHORED"
+  (let ((anchor (check-anchor path)))
+    (unless (eq anchor :anchored)
+      (error "audit log ~a has a torn last line and its checkpoint is ~(~a~); refusing to cut it"
+             path anchor))
+    anchor))
+
+(defun cut-anchored-torn-tail (path)
+  "Cut the torn last line off the log at PATH, after checking the cut stays past the checkpoint.
+Returns the cut's :TORN-TAIL fields. Signals without touching the file when the checkpoint covers the line"
+  (refuse-unanchored-tail path)
+  (let ((cut (cut-torn-tail path)))
+    (refuse-broken-chain path)
+    cut))
+
 (defun repair-or-refuse (path)
-  "Make the PATH safe to append to. Returns :INTACT, :NEWLIE-ADDED, or the fields
-of a cut torn tale; singals on any other break"
+  "Make the PATH safe to append to. Returns :INTACT, :NEWLINE-ADDED, or the fields
+of a cut torn tail; signals on any other break"
   (multiple-value-bind (ok count break-seq reason) (verify-audit-chain path)
     (declare (ignore count break-seq))
     (cond ((and ok (missing-final-newline-p path)) (terminate-last-line path))
           (ok :intact)
-          ((eq reason :torn-tail) (let ((cut (cut-torn-tail path)))
-                                    (refuse-broken-chain path)
-                                    cut))
+          ((eq reason :torn-tail) (cut-anchored-torn-tail path))
           (t (refuse-broken-chain path)))))
 
 (defun boot-fields ()
@@ -431,7 +450,7 @@ of a cut torn tale; singals on any other break"
         :core (namestring sb-ext:*core-pathname*)))
 
 (defun repair-for-resume (path)
-  "REPAIR-OR-REFUSE for an existin log. Refuse if checkpoint remains because
+  "REPAIR-OR-REFUSE for an existing log. Refuse if checkpoint remains because
 the whole log is the furthest truncation"
   (cond ((probe-file path) (repair-or-refuse path))
         ((probe-file (checkpoint-path path))
@@ -440,7 +459,7 @@ the whole log is the furthest truncation"
         (t :intact)))
 
 (defun resume-audit-log (path)
-  "Append to the log at PATH, continuing the chaing, and record this boot.
+  "Append to the log at PATH, continuing the chain, and record this boot.
 Torn last line is cut first and cut audited"
   (let ((repair (repair-for-resume path)))
     (multiple-value-bind (seq prev-hash) (chain-tail path)

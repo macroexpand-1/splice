@@ -58,7 +58,10 @@
            (let ((header (with-open-file (in path) (d:read-snapshot in))))
              (is (eql 2 (getf header :act)))
              (is (eql 2002 (getf header :seed)))
-             (is (eql 3 (getf header :threads)))))
+             (is (eql 3 (getf header :threads)))
+             (is (equal splice::*boot-id* (getf header :boot-id)))
+             (is (equal (and d:*demo-log-path* (namestring d:*demo-log-path*))
+                        (getf header :audit-log)))))
       (d::close-recording)
       (when path (uiop:delete-file-if-exists path))
       (setf d::*recorder* old))))
@@ -72,6 +75,34 @@
              (d:open-gate d:*gate* :next-stage)
              (is (eq :next-stage (sb-thread:join-thread waiter :timeout 2 :default :timed-out)))))
       (setf d:*gate* old))))
+
+(test a-crashed-act-is-kept-and-shown
+  (let ((outcome d:*act-outcome*))
+    (unwind-protect
+         (progn
+           (is (eq :crashed (d:run-act 3)))
+           (is (stringp d:*act-outcome*))
+           (is (equal (list d:*act-outcome* "sink failed: X")
+                      (d::with-act-fault (list "sink failed: X")))))
+      (setf d:*act-outcome* outcome))))
+
+(test stopping-an-act-releases-its-waits
+  (let ((gate d:*gate*)
+        (old d::*session-thread*)
+        (act d:*current-act*)
+        (recorder d::*recorder*))
+    (setf d:*gate* (d:make-gate)
+          d:*current-act* 1
+          d::*recorder* nil
+          d::*session-thread* (sb-thread:make-thread (lambda () (d::act-1-pace 0))))
+    (unwind-protect
+         (progn
+           (is (eq :none (d:stop-act)))
+           (is (not (sb-thread:thread-alive-p d::*session-thread*))))
+      (setf d:*gate* gate
+            d::*session-thread* old
+            d:*current-act* act
+            d::*recorder* recorder))))
 
 (test act-1-unattended
   (with-demo-log (path)
