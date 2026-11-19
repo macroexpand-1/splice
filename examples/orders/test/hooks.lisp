@@ -103,8 +103,8 @@ SYMBOL is not evaluated."
     (with-global (splice::*drain-timeout-seconds* 60)
       (setf orders:*live-session* nil)
       (let* ((gate (sb-thread:make-semaphore))
-             ;; a set that catches 2x passes its stages in about 40000 tasks,
-             ;; inside the wait below; the default 1.3x takes about 350000
+             ;; a set that catches 2x passes its stages in about 43000 tasks,
+             ;; inside the wait below; the default 1.3x takes about 383000
              (thread (session-thread :seed 1001 :threads 3 :quiet t :settle-timeout 90
                                      :min-effect 1d0
                                      :pace (held-task-pace gate)))

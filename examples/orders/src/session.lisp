@@ -163,7 +163,9 @@ restore. CORRUPTED orders fail forward migration under :migration."
 again for slack."
   (ceiling (* 3/2 (reduce #'+ ramp
                           :key (lambda (fraction)
-                                 (/ (splice:stage-budget fraction :alpha alpha :beta beta
+                                 (/ (splice:stage-budget fraction :alpha alpha
+                                                                  :stage-count (length ramp)
+                                                                  :beta beta
                                                                   :min-effect min-effect)
                                     (/ fraction 100)))))))
 

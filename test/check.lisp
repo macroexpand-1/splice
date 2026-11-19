@@ -9,7 +9,7 @@
 ;;;; Each check gets its own image because the demo and the criteria patch the
 ;;;; live image, and a suite loaded beside them would see what they changed.
 ;;;;
-;;;; The criteria run 100 times per fault class, about 2 to 4 minutes. C7 is
+;;;; The criteria run 100 times per fault class, about 15 minutes. C7 is
 ;;;; a timing check (the canary shim must cost under 2x a plain call, 1.37x
 ;;;; locally), so it is the likeliest to flake on a noisy machine.
 

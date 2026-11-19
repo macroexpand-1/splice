@@ -122,3 +122,65 @@
     (signals splice:illegal-transition (splice:unfreeze ps :sideways :operator "unit-tests"))
     (is (eq :frozen (splice:patch-set-state ps)))
     (is-true (splice::patch-set-freeze-reason ps))))
+
+;;; ---------------------------------------------------------------------
+;;; A task that fails before its body runs
+
+(defun run-sampled-task ()
+  "Run one probe task whose id is sampled, so it writes a :task-sample entry"
+  (splice:with-task (:id splice::*task-sample-every*)
+    (funcall 'lifecycle-probe 1)))
+
+(test a-refused-sample-audit-releases-its-pins
+  "A sampled task whose audit write is refused leaves no pin counted and
+reports no observation"
+  (with-temp-log-path (path)
+    (let ((log (splice:open-audit-log path)))
+      (with-installed-set (ps (healthy-probe-set 'refused-sample))
+        ;; a closed checkpoint fails the next write and latches the log
+        (close (splice::audit-log-checkpoint log))
+        (is (typep (escaped-error #'run-sampled-task) 'error))
+        (is (= 0 (splice::patch-set-pinned-new ps)))
+        (is (= 0 (splice::patch-set-pinned-old ps)))
+        (is (= 0 (splice::canary-stage-observations (splice::patch-set-stage ps))))
+        (is (= 0 (splice::control-ring-count (splice::patch-set-control-ring ps))))
+        ;; retiring audits; with the latched log closed, those entries go unlogged
+        (splice:close-audit-log)))))
+
+;;; ---------------------------------------------------------------------
+;;; What a task's latency counts
+
+(defun old-routed-task-id (ps)
+  "First task id that draws :old on PS at every stage below 100"
+  (loop for id from 1
+        when (= 99 (splice::routing-draw id (splice:patch-set-name ps)))
+          return id))
+
+(defun last-control-latency (ps)
+  "The latency of PS's most recent control observation"
+  (let ((ring (splice::patch-set-control-ring ps)))
+    (aref (splice::control-ring-latencies ring)
+          (mod (1- (splice::control-ring-head ring))
+               (splice::control-ring-size ring)))))
+
+(defun hold-set-lock-after (ps signal held seconds)
+  "Start a thread that waits on SIGNAL, takes PS's lock, signals HELD and
+keeps the lock for SECONDS. Returns the thread"
+  (sb-thread:make-thread
+   (lambda ()
+     (sb-thread:wait-on-semaphore signal)
+     (splice::with-set-lock (ps)
+       (sb-thread:signal-semaphore held)
+       (sleep seconds)))))
+
+(test a-task-latency-leaves-out-the-wait-to-release
+  "A task whose pins wait on the set lock reports only its body's time"
+  (with-installed-set (ps (healthy-probe-set 'lock-wait))
+    (let* ((body-done (sb-thread:make-semaphore))
+           (lock-held (sb-thread:make-semaphore))
+           (holder (hold-set-lock-after ps body-done lock-held 0.2)))
+      (splice:with-task (:id (old-routed-task-id ps))
+        (sb-thread:signal-semaphore body-done)
+        (sb-thread:wait-on-semaphore lock-held))
+      (sb-thread:join-thread holder)
+      (is (< (last-control-latency ps) 100)))))

@@ -81,7 +81,8 @@
   "A :CANARY-100 set with an empty control ring and stage limit LIMIT."
   (let ((ps (bare-set :canary-100 :ramp '(100) :current-fraction 100 :stage-index 0
                       :stage-limit limit :runtime-contract-interval 0
-                      :control-ring (splice::make-control-ring))))
+                      :control-ring (splice::make-control-ring)
+                      :null-ring (splice::make-control-ring))))
     (setf (splice::patch-set-stage ps) (splice::fresh-stage ps 100))
     ps))
 
@@ -99,6 +100,22 @@
     (splice::report-outcome ps :new nil 1.0)
     (splice::with-set-lock (ps) (splice::enter-stage ps 0))
     (is (= 0 (splice::canary-stage-observations (splice::patch-set-stage ps))))))
+
+(test only-a-stage-with-a-control-arm-tests-latency
+  (let ((ps (starved-stage-set 10)))
+    (is (eq :unscored (splice::canary-stage-latency-test (splice::fresh-stage ps 25))))
+    (is (eq :untested (splice::canary-stage-latency-test (splice::fresh-stage ps 100))))))
+
+(test a-full-stage-scores-slow-canaries-without-rejecting
+  "At 100% nothing compares latency, so slow canaries count toward the budget"
+  (let ((ps (starved-stage-set 1000)))
+    (dotimes (i 200)
+      (splice::control-record (splice::patch-set-null-ring ps) nil 1.0))
+    (dotimes (i 200)
+      (splice::report-outcome ps :new nil 1000.0))
+    (is (eq :canary-100 (splice:patch-set-state ps)))
+    (is (= 200 (splice::canary-stage-scored (splice::patch-set-stage ps))))
+    (is (eq :untested (splice::canary-stage-latency-test (splice::patch-set-stage ps))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Completion threads

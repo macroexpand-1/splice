@@ -15,6 +15,9 @@ already recorded, so an error unwinding through nested shims counts once.
   "Task ids handed out so far. A cons for ATOMIC-INCF.")
 (defvar *task-sample-every* 50
   "Log every Nth task's pinned routes to the audit log.")
+(defconstant +clock-monotonic-raw+ 4
+  "CLOCK_MONOTONIC_RAW's id on Darwin and Linux alike. SB-UNIX names only
+CLOCK_MONOTONIC, which ticks in whole microseconds on Darwin")
 
 (defun next-task-id ()
   (1+ (sb-ext:atomic-incf (car *task-counter-cell*))))
@@ -101,53 +104,96 @@ Fallback counts against :NEW only"
     (or (eq outcome :failure)
         (and (eq route :new) (fell-back-p ps)))))
 
+(defun monotonic-ns ()
+  "Nanoseconds on the raw monotonic clock. GET-INTERNAL-REAL-TIME ticks in
+microseconds, coarser than a fast task"
+  (multiple-value-bind (seconds nanoseconds)
+      (sb-unix:clock-gettime +clock-monotonic-raw+)
+    (+ (* seconds 1000000000) nanoseconds)))
+
+(defun elapsed-ms (start-ns)
+  "Milliseconds since START-NS on the monotonic clock"
+  (/ (- (monotonic-ns) start-ns) 1d6))
+
+(defun audit-task-sample (task-id task-epochs)
+  "Log TASK-ID's pins when it is a sampled task, enough to re-derive routing
+offline. Returns :sampled or :skipped"
+  (cond ((and task-epochs (integerp task-id)
+              (zerop (mod task-id *task-sample-every*)))
+         (audit :task-sample :task task-id
+                             :pins (mapcar #'pin-sample task-epochs))
+         :sampled)
+        (t :skipped)))
+
+(defun pin-sample (pin)
+  "Plist describing PIN for a :task-sample entry"
+  (destructuring-bind (ps route) pin
+    (list :patch-set (patch-set-name ps)
+          :route route
+          :fraction (patch-set-current-fraction ps)
+          :state (patch-set-state ps))))
+
+(defun pin-active-sets (task-id)
+  "Pin TASK-ID on every active canary set, adding each pin to *TASK-EPOCHS*
+as it is taken, so a failure partway leaves only taken pins to release"
+  (dolist (ps (active-canary-sets))
+    (setf *task-epochs* (append *task-epochs* (list (pin-and-count ps task-id))))))
+
 (defun call-with-task (id thunk &key (swallow-errors nil))
   "Run THUNK as one task: pin routes, count in-flight tasks, and report the
 outcome to each pinned set. The FALLBACK-TO-OLD restart retries the whole task
-on old code."
-  (let* ((*task-id* (or id (next-task-id)))
-         (sets (active-canary-sets))
-         (*task-epochs* (mapcar (lambda (ps) (pin-and-count ps *task-id*)) sets))
-         (*task-anomaly-noted* '())
-         (start (get-internal-real-time))
-         (outcome :success))
-    ;; sampled pins, enough to re-derive routing offline
-    (when (and *task-epochs* (integerp *task-id*)
-               (zerop (mod *task-id* *task-sample-every*)))
-      (audit :task-sample :task *task-id*
-                          :pins (mapcar (lambda (pin)
-                                          (list :patch-set (patch-set-name (car pin))
-                                                :route (cadr pin)
-                                                :fraction (patch-set-current-fraction
-                                                           (car pin))
-                                                :state (patch-set-state (car pin))))
-                                        *task-epochs*)))
+on old code. A failure before THUNK runs releases the pins taken and reports
+nothing."
+  (let ((*task-id* (or id (next-task-id)))
+        (*task-epochs* '())
+        (*task-anomaly-noted* '())
+        (outcome :not-run)
+        (start 0))
+    ;; open before pinning, so a failure while pinning or sampling releases
+    ;; every pin taken so far
     (unwind-protect
-         (restart-case
-             ;; record in whichever handler receives the error: a HANDLER-CASE
-             ;; would unwind before an outer HANDLER-BIND could record it
-             (if swallow-errors
-                 (handler-case (funcall thunk)
-                   (error () (setf outcome :failure) nil))
-                 (handler-bind ((error (lambda (e)
-                                         (declare (ignore e))
-                                         (setf outcome :failure))))
-                   (funcall thunk)))
-           (fallback-to-old ()
-             :report "Retry this task with every patch set routed to old code."
-             (let ((*task-epochs* (mapcar (lambda (pin) (list (car pin) :old))
-                                          *task-epochs*)))
-               (funcall thunk))))
-      ;; release pins before reporting: a rollback would wait on these counts
-      (dolist (pin *task-epochs*)
-        (with-set-lock ((car pin))
-          (if (eq (cadr pin) :new)
-              (decf (patch-set-pinned-new (car pin)))
-              (decf (patch-set-pinned-old (car pin))))))
-      (let ((latency-ms (/ (* 1000.0 (- (get-internal-real-time) start))
-                           internal-time-units-per-second)))
-        (dolist (pin *task-epochs*)
-          (report-outcome (car pin) (cadr pin) (pin-failed-p pin outcome) latency-ms))))))
+         (progn
+           (pin-active-sets *task-id*)
+           ;; before the clock starts: the sample's log write is not the task's latency
+           (audit-task-sample *task-id* *task-epochs*)
+           (setf start (monotonic-ns)
+                 outcome :success)
+           (restart-case
+               ;; record in whichever handler receives the error: a HANDLER-CASE
+               ;; would unwind before an outer HANDLER-BIND could record it
+               (if swallow-errors
+                   (handler-case (funcall thunk)
+                     (error () (setf outcome :failure) nil))
+                   (handler-bind ((error (lambda (e)
+                                           (declare (ignore e))
+                                           (setf outcome :failure))))
+                     (funcall thunk)))
+             (fallback-to-old ()
+               :report "Retry this task with every patch set routed to old code."
+               (let ((*task-epochs* (mapcar (lambda (pin) (list (car pin) :old))
+                                            *task-epochs*)))
+                 (funcall thunk)))))
+      ;; time the body alone: RELEASE-PINS waits on the set lock, which other
+      ;; threads hold while they score their own tasks
+      (let ((latency-ms (elapsed-ms start)))
+        ;; release pins before reporting: a rollback would wait on these counts
+        (release-pins *task-epochs*)
+        (unless (eq outcome :not-run)
+          (report-task-outcome *task-epochs* outcome latency-ms))))))
+
+(defun release-pins (task-epochs)
+  "Uncount each of TASK-EPOCHS' pins from its set's in-flight tasks"
+  (dolist (pin task-epochs)
+    (destructuring-bind (ps route) pin
+      (with-set-lock (ps)
+        (if (eq route :new)
+            (decf (patch-set-pinned-new ps))
+            (decf (patch-set-pinned-old ps)))))))
+
+(defun report-task-outcome (task-epochs outcome latency-ms)
+  "Report OUTCOME and LATENCY-MS to the set of each of TASK-EPOCHS' pins"
+  (dolist (pin task-epochs)
+    (report-outcome (car pin) (cadr pin) (pin-failed-p pin outcome) latency-ms)))
 
 (defmacro with-task ((&key id (swallow-errors nil)) &body body)
   `(call-with-task ,id (lambda () ,@body) :swallow-errors ,swallow-errors))

@@ -27,7 +27,7 @@ observations go by. Returns the verdict."
 
 (test one-alternative-is-the-plain-likelihood-ratio
   (let* ((splice::*harm-steps* 1)
-         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :min-effect 3d0)))
+         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 3d0)))
     (splice:mixture-observe test :new t)
     (is (close-to (log (/ 4d0 3)) (splice:mixture-log-odds test)))
     (splice:mixture-observe test :old t)
@@ -36,33 +36,48 @@ observations go by. Returns the verdict."
 (test the-mixture-averages-the-alternatives
   ;; ratios 2 and 4 on a half share give shares 2/3 and 4/5
   (let* ((splice::*harm-steps* 2)
-         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :min-effect 3d0)))
+         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 3d0)))
     (splice:mixture-observe test :new t)
     (is (close-to (log (/ (+ (/ 4d0 3) (/ 8d0 5)) 2)) (splice:mixture-log-odds test)))))
 
 (test two-sample-counts-only-events
-  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (splice:mixture-observe test :new nil)
     (splice:mixture-observe test :old nil)
     (is (= 0 (splice::mixture-test-hits test) (splice::mixture-test-misses test)))
     (is (close-to 0d0 (splice:mixture-log-odds test)))))
 
 (test one-sample-ignores-the-control-arm
-  (let ((test (splice:make-mixture-test :one-sample 0.01d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :one-sample 0.01d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (splice:mixture-observe test :old t)
     (is (= 0 (splice::mixture-test-hits test) (splice::mixture-test-misses test)))
     (splice:mixture-observe test :new nil)
     (is (= 1 (splice::mixture-test-misses test)))))
 
 (test rejects-at-two-over-alpha
-  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (is (close-to (log 200d0) (splice::mixture-test-log-reject test)))
     (is (eq :reject (observe-until-decided test :new t 100)))
     (is (>= (splice:mixture-log-odds test) (log 200d0)))))
 
+(test alpha-is-split-across-every-test-in-a-session
+  ;; two signals per stage, three stages: six tests share the session's alpha
+  (is (close-to (/ 0.01d0 6) (splice::test-alpha 0.01d0 3)))
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0
+                                        :alpha 0.01d0 :stage-count 3 :min-effect 0.3d0)))
+    (is (close-to (log 600d0) (splice::mixture-test-log-reject test)))))
+
+(test a-missing-stage-count-is-refused
+  (signals error (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :min-effect 0.3d0))
+  (signals error (splice:stage-budget 5 :alpha 0.01d0 :beta 0.05d0 :min-effect 0.3d0)))
+
+(test more-stages-need-bigger-budgets
+  (is (< (splice:stage-budget 25 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0)
+         (splice:stage-budget 25 :alpha 0.01d0 :stage-count 3 :beta 0.05d0 :min-effect 0.3d0))))
+
 (test a-better-new-arm-never-rejects
   ;; events on a 5% arm, but the new arm has a fortieth of them, half its share
-  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (is (eq :continue (loop for i from 1 to 2000
                             for route = (if (zerop (mod i 40)) :new :old)
                             for verdict = (splice:mixture-observe test route t)
@@ -71,15 +86,15 @@ observations go by. Returns the verdict."
     (is (< (splice:mixture-log-odds test) 0d0))))
 
 (test a-null-share-outside-the-unit-interval-is-refused
-  (signals error (splice:make-mixture-test :one-sample 0d0 :alpha 0.01d0 :min-effect 0.3d0))
-  (signals error (splice:make-mixture-test :two-sample 1d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (signals error (splice:make-mixture-test :one-sample 0d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0))
+  (signals error (splice:make-mixture-test :two-sample 1d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
 
 (test an-unknown-route-is-refused
-  (let ((test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (signals error (splice:mixture-observe test :sideways t))))
 
 (test snapshot-carries-the-whole-test-state
-  (let ((test (splice:make-mixture-test :two-sample 0.25d0 :alpha 0.01d0 :min-effect 0.3d0)))
+  (let ((test (splice:make-mixture-test :two-sample 0.25d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
     (splice:mixture-observe test :new t)
     (let ((snapshot (splice::mixture-snapshot test :errors)))
       (is (eq :errors (getf snapshot :signal)))
@@ -94,18 +109,18 @@ observations go by. Returns the verdict."
 
 (test budgets-for-the-default-options
   (flet ((budget (fraction)
-           (splice:stage-budget fraction :alpha 0.01d0 :beta 0.05d0 :min-effect 0.3d0)))
+           (splice:stage-budget fraction :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0)))
     (is (= 9004 (budget 5)))
     (is (= 11450 (budget 25)))
     (is (= 17256 (budget 50)))
     (is (= 9136 (budget 100)))))
 
 (test a-larger-effect-needs-a-smaller-budget
-  (is (< (splice:stage-budget 50 :alpha 0.01d0 :beta 0.05d0 :min-effect 3d0)
-         (splice:stage-budget 50 :alpha 0.01d0 :beta 0.05d0 :min-effect 0.3d0))))
+  (is (< (splice:stage-budget 50 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 3d0)
+         (splice:stage-budget 50 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0))))
 
 (test an-unlisted-beta-is-refused
-  (signals error (splice:stage-budget 5 :alpha 0.01d0 :beta 0.07d0 :min-effect 0.3d0)))
+  (signals error (splice:stage-budget 5 :alpha 0.01d0 :stage-count 1 :beta 0.07d0 :min-effect 0.3d0)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Control ring
@@ -144,10 +159,3 @@ observations go by. Returns the verdict."
 (test latency-quantile-needs-enough-samples
   (is (eq :too-few-samples
           (splice::control-latency-quantile (ring-with (make-list 29)) 0.5))))
-
-(test exceedance-rate-counts-latencies-above-the-threshold
-  (let ((ring (splice::make-control-ring :size 100)))
-    (loop for ms from 1 to 100
-          do (splice::control-record ring nil ms))
-    (is (close-to 0.05d0 (splice::control-exceedance-rate ring 95)))
-    (is (close-to 0d0 (splice::control-exceedance-rate ring 100)))))

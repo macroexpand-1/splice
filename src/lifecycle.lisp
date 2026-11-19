@@ -27,9 +27,9 @@ This is off by default, a long criteria would log every observation")
   (reverse (patch-set-history ps)))
 
 (defun baseline-failure-rate (ps)
-  "The control arm's failure rate, or a 0.001 prior until the arm has enough
-samples"
-  (let ((rate (control-failure-rate (patch-set-control-ring ps))))
+  "The control arm's failure rate over the null ring, or a 0.001 prior until
+the arm has enough samples"
+  (let ((rate (control-failure-rate (patch-set-null-ring ps))))
     (if (eq rate :too-few-samples) 0.001d0 rate)))
 
 ;;; ---------------------------------------------------------------------
@@ -43,10 +43,10 @@ samples"
   (budget 0 :read-only t)               ; scored :new observations to pass
   (error-test nil :read-only t)
   ;; mutable
-  (latency-test :unscored)              ; a MIXTURE-TEST once the threshold is fixed
+  (latency-test :unscored)              ; :unscored, then a MIXTURE-TEST; :untested at 100%
   (latency-threshold :unset)            ; control p95 in ms, fixed once per stage
   (observations 0)                      ; every :new observation
-  (scored 0))                           ; :new observations both tests scored
+  (scored 0))                           ; :new observations every test it runs scored
 
 (defun test-kind (fraction)
   "A stage with a control arm compares the arms; at 100% there is none."
@@ -62,33 +62,37 @@ samples"
   "A new CANARY-STAGE for PS at FRACTION percent."
   (%make-canary-stage
    :fraction fraction
-   :budget (stage-budget fraction :alpha (patch-set-alpha ps) :beta (patch-set-beta ps)
+   :budget (stage-budget fraction :alpha (patch-set-alpha ps)
+                                  :stage-count (length (patch-set-ramp ps))
+                                  :beta (patch-set-beta ps)
                                   :min-effect (patch-set-min-effect ps))
    :error-test (make-mixture-test (test-kind fraction) (error-null-share ps fraction)
                                   :alpha (patch-set-alpha ps)
-                                  :min-effect (patch-set-min-effect ps))))
+                                  :stage-count (length (patch-set-ramp ps))
+                                  :min-effect (patch-set-min-effect ps))
+   :latency-test (initial-latency-test fraction)))
 
-(defun latency-null-share (canary-stage ring threshold-ms)
-  "The latency test's hit probability when the new code is no worse, or
-:UNSCORED when the control arm gives none to test against."
-  (ecase (test-kind (canary-stage-fraction canary-stage))
-    (:two-sample (/ (canary-stage-fraction canary-stage) 100d0))
-    (:one-sample (let ((rate (control-exceedance-rate ring threshold-ms)))
-                   (if (and (realp rate) (< 0d0 rate 1d0)) rate :unscored)))))
+(defun initial-latency-test (fraction)
+  "A stage with a control arm waits for its latency threshold. At 100% the
+only null would come from an earlier period, and latency drifts between
+periods by as much as the effect the test looks for, so that stage has no
+latency test."
+  (ecase (test-kind fraction)
+    (:two-sample :unscored)
+    (:one-sample :untested)))
 
 (defun fix-latency-threshold (ps canary-stage)
-  "Fix the stage's latency threshold at the control p95 and build its test,
-once the ring has enough samples. Returns :fixed or :unscored."
-  (let* ((ring (patch-set-control-ring ps))
-         (p95 (control-latency-quantile ring 0.95))
-         (share (if (eq p95 :too-few-samples)
-                    :unscored
-                    (latency-null-share canary-stage ring p95))))
-    (cond ((eq share :unscored) :unscored)
+  "Fix the stage's latency threshold at the control p95 and build its
+two-sample test, once the null ring has enough samples. Returns :fixed or
+:unscored."
+  (let ((p95 (control-latency-quantile (patch-set-null-ring ps) 0.95)))
+    (cond ((eq p95 :too-few-samples) :unscored)
           (t (setf (canary-stage-latency-threshold canary-stage) p95
                    (canary-stage-latency-test canary-stage)
-                   (make-mixture-test (test-kind (canary-stage-fraction canary-stage)) share
+                   (make-mixture-test :two-sample
+                                      (/ (canary-stage-fraction canary-stage) 100d0)
                                       :alpha (patch-set-alpha ps)
+                                      :stage-count (length (patch-set-ramp ps))
                                       :min-effect (patch-set-min-effect ps)))
              :fixed))))
 
@@ -100,7 +104,7 @@ holds the lock. Returns :scored or :unscored."
       (fix-latency-threshold ps stage))
     (mixture-observe (canary-stage-error-test stage) route failure-p)
     (let ((latency (canary-stage-latency-test stage)))
-      (unless (eq latency :unscored)
+      (when (mixture-test-p latency)
         (mixture-observe latency route
                          (> latency-ms (canary-stage-latency-threshold stage))))
       (when (eq route :new)
@@ -133,7 +137,8 @@ or one on a set that isn't registered, is refused with ILLEGAL-TRANSITION."
         (dolist (cp (patch-set-class-patches ps))
           (rollback-class-patch ps cp))
         (error e)))
-    (setf (patch-set-control-ring ps) (make-control-ring))
+    (setf (patch-set-control-ring ps) (make-control-ring)
+          (patch-set-null-ring ps) (make-control-ring :size *null-ring-size*))
     ;; shims start dormant, routing :old until the stage flip
     (install-fn-shims ps)
     (install-method-shims ps)
@@ -177,24 +182,28 @@ transition. Returns the action taken: :continue when nothing changed, otherwise
 
 (defun report-outcome-locked (ps route failure-p latency-ms)
   "The locked stuff"
-  (let ((ring (patch-set-control-ring ps)))
-    (unless (canary-stage-p (patch-set-state ps))
-      (when (and ring (eq route :old))
-        (control-record ring failure-p latency-ms))
-      (return-from report-outcome-locked :continue))
-    ;; hard triggers fire on any route: a migration failure can surface in
-    ;; an old-routed task, and at 5% the next canary task may be far off
-    (let ((trigger (take-hard-trigger ps)))
-      (unless (eq trigger :unarmed)
-        (return-from report-outcome-locked
-          (initiate-rollback-locked ps (cons :hard-trigger trigger)))))
-    (cond
-      ((eq route :old)
-       (control-record ring failure-p latency-ms)
-       (fold-stage-observation ps :old failure-p latency-ms)
-       (check-control-arm ps))
-      (t                              ; :new, a canary observation
-       (evaluate-canary-observation ps failure-p latency-ms)))))
+  (unless (canary-stage-p (patch-set-state ps))
+    (when (and (patch-set-control-ring ps) (eq route :old))
+      (record-control ps failure-p latency-ms))
+    (return-from report-outcome-locked :continue))
+  ;; hard triggers fire on any route: a migration failure can surface in
+  ;; an old-routed task, and at 5% the next canary task may be far off
+  (let ((trigger (take-hard-trigger ps)))
+    (unless (eq trigger :unarmed)
+      (return-from report-outcome-locked
+        (initiate-rollback-locked ps (cons :hard-trigger trigger)))))
+  (cond
+    ((eq route :old)
+     (record-control ps failure-p latency-ms)
+     (fold-stage-observation ps :old failure-p latency-ms)
+     (check-control-arm ps))
+    (t                              ; :new, a canary observation
+     (evaluate-canary-observation ps failure-p latency-ms))))
+
+(defun record-control (ps failure-p latency-ms)
+  "Record one control observation in both of PS's rings"
+  (control-record (patch-set-control-ring ps) failure-p latency-ms)
+  (control-record (patch-set-null-ring ps) failure-p latency-ms))
 
 (defun check-control-arm (ps)
   "Freeze PS when the control arm is too degraded for any canary verdict to
@@ -228,7 +237,7 @@ breakage is not a rate question."
 
 (defun latency-rejects-p (canary-stage)
   (let ((latency (canary-stage-latency-test canary-stage)))
-    (and (not (eq latency :unscored))
+    (and (mixture-test-p latency)
          (eq :reject (mixture-verdict latency)))))
 
 (defun stage-verdict (ps canary-stage)
@@ -276,9 +285,9 @@ observation count as :N, which detection-time readers use."
 
 (defun latency-snapshot (canary-stage)
   (let ((latency (canary-stage-latency-test canary-stage)))
-    (if (eq latency :unscored)
-        :unscored
-        (mixture-snapshot latency :latency))))
+    (if (mixture-test-p latency)
+        (mixture-snapshot latency :latency)
+        latency)))
 
 (defun stage-timeout-cause (ps canary-stage)
   (list :stage-timeout
@@ -290,11 +299,12 @@ observation count as :N, which detection-time readers use."
         :latency (latency-snapshot canary-stage)))
 
 (defun stage-point (canary-stage mixture-test)
-  "The test's position as (observations . log-odds); an unscored test is 0."
+  "The test's position as (observations . log-odds); an unscored or untested
+test is 0."
   (cons (canary-stage-observations canary-stage)
-        (if (eq mixture-test :unscored)
-            0.0
-            (float (mixture-log-odds mixture-test) 1.0))))
+        (if (mixture-test-p mixture-test)
+            (float (mixture-log-odds mixture-test) 1.0)
+            0.0)))
 
 (defun audit-sprt-step (ps)
   "Audit a canary observation's test positions when *AUDIT-SPRT-STEPS* is on"

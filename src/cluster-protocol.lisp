@@ -201,8 +201,10 @@ or PATCH-VETOED when a static check refuses."
                 :rollback-sent rollback-sent))
 
 (defun empty-cluster (alpha beta)
-  "Cluster with no members, whose pooled error test rejects at 2/ALPHA (as
-each member's does). BETA sizes stage budgets, not this threshold."
+  "Cluster with no members, whose pooled error test rejects at 2/ALPHA.
+That is a single stage's share: each member's own tests reject at one over
+TEST-ALPHA, split across every stage, and the pooled test takes no share of
+that split. BETA sizes stage budgets, not this threshold."
   (declare (ignore beta))
   (make-cluster :upper-milli (round (* 1000 (log (/ 2d0 alpha))))))
 

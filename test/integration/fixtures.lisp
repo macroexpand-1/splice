@@ -32,7 +32,7 @@ rejects within a few observations."
 
 (defun healthy-probe-set (name)
   "Two stages, so passing the first enters the second rather than starting
-a promotion thread. A 4x smallest effect keeps the budget near 340."
+a promotion thread. A 4x smallest effect keeps the budget near 360."
   (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) x))))
     (setf (splice::patch-set-ramp ps) '(50 100)
           (splice::patch-set-min-effect ps) 3d0

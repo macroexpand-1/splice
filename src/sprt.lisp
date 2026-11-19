@@ -16,6 +16,12 @@
   "Share of control observations above the control p95, by construction.
 Stage budgets are sized on the latency signal at this rate.")
 
+(defparameter *null-ring-size* 5000
+  "Control observations the null ring keeps. It gives the latency threshold
+and the one-sample error test's null; at a 5% rate, 5000 samples put an
+estimate's relative standard error near 6%, well under a 0.3 MIN-EFFECT,
+where 500 put it near 20%.")
+
 (defparameter *harm-steps* 8
   "Number of harm ratios the mixture spreads its weight over.")
 
@@ -43,11 +49,24 @@ given the hit probability NULL-SHARE when they are equal (paper, eq. 12)."
   (let ((new (* null-share ratio)))
     (/ new (+ (- 1d0 null-share) new))))
 
-(defun make-mixture-test (kind null-share &key alpha min-effect)
+(defun test-alpha (alpha stage-count)
+  "One test's share of a session's ALPHA. A session runs at most two tests
+(errors and latency) at each of its STAGE-COUNT stages, so an even split keeps
+the chance of any spurious rollback in the session at most ALPHA."
+  (assert (and (integerp stage-count) (plusp stage-count)) ()
+          "stage count ~s is not a positive integer" stage-count)
+  (/ alpha (* 2 stage-count)))
+
+(defun log-reject-threshold (alpha stage-count)
+  "Log odds at which one test rejects: one over its share of ALPHA."
+  (log (/ 1d0 (test-alpha alpha stage-count))))
+
+(defun make-mixture-test (kind null-share &key alpha stage-count min-effect)
   "A test of KIND against NULL-SHARE. A :TWO-SAMPLE hit is an event on the
 new arm and its NULL-SHARE is the new arm's traffic share. A :ONE-SAMPLE hit
 is a new-arm observation with an event and its NULL-SHARE is the control
-arm's event rate. Rejects at 2/ALPHA, half the stage's alpha per signal."
+arm's event rate. ALPHA is the whole session's; the test rejects at one over
+its TEST-ALPHA share of it."
   (let ((share (coerce null-share 'double-float)))
     (assert (< 0d0 share 1d0) () "null share ~a is not inside (0, 1)" share)
     (%make-mixture-test
@@ -55,7 +74,7 @@ arm's event rate. Rejects at 2/ALPHA, half the stage's alpha per signal."
      :null-share share
      :alternatives (mapcar (lambda (ratio) (harm-share share ratio))
                            (harm-ratios min-effect))
-     :log-reject (log (/ 2d0 alpha)))))
+     :log-reject (log-reject-threshold alpha stage-count))))
 
 (defun mixture-observe (mixture-test route event-p)
   "Fold one observation on ROUTE into MIXTURE-TEST and return its verdict."
@@ -128,6 +147,8 @@ recomputed from the log alone."
 ;;; Stage budget
 ;;; New-arm observations a stage needs before passing: enough for the
 ;;; latency test to reach its threshold at 1+MIN-EFFECT with power 1-BETA.
+;;; A 100% stage has no latency test, so its budget is a soak of the size
+;;; a one-sample latency test would need, while its error test runs.
 ;;; A normal approximation to the mixture's drift, not from the paper.
 
 (defun power-z-score (beta)
@@ -170,21 +191,23 @@ MEAN must be positive, otherwise no n ever crosses."
         when (>= (- (* n mean) (* z (sqrt (* n variance)))) distance)
           return n))
 
-(defun stage-budget (fraction &key alpha beta min-effect)
-  "New-arm observations a stage at FRACTION percent scores before it passes."
+(defun stage-budget (fraction &key alpha stage-count beta min-effect)
+  "New-arm observations a stage at FRACTION percent scores before it passes,
+in a session of STAGE-COUNT stages whose whole alpha is ALPHA."
   (multiple-value-bind (mean variance)
       (if (< fraction 100)
           (two-sample-drift (/ fraction 100d0) min-effect)
           (one-sample-drift min-effect))
     (observations-to-cross mean variance
                            ;; the min-effect component carries 1/*HARM-STEPS* weight
-                           (+ (log (/ 2d0 alpha)) (log *harm-steps*))
+                           (+ (log-reject-threshold alpha stage-count)
+                              (log *harm-steps*))
                            (power-z-score beta))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Control-arm tracking
-;;; Ring buffers of recent control outcomes/latencies give the baseline and
-;;; the confound check.
+;;; Ring buffers of control outcomes and latencies. A short recent one feeds
+;;; the confound check; a long one gives the tests their nulls and thresholds.
 
 (defstruct (control-ring (:constructor %make-control-ring))
   (outcomes nil :read-only t)
@@ -226,14 +249,4 @@ MEAN must be positive, otherwise no n ever crosses."
       (if (>= n min-samples)
           (let ((sorted (sort (subseq (control-ring-latencies ring) 0 n) #'<)))
             (aref sorted (min (1- n) (floor (* q n)))))
-          :too-few-samples))))
-
-(defun control-exceedance-rate (ring threshold-ms &key (min-samples 30))
-  "Share of the ring's latencies above THRESHOLD-MS or :TOO-FEW-SAMPLES"
-  (sb-thread:with-mutex ((control-ring-lock ring))
-    (let ((n (control-ring-count ring)))
-      (if (>= n min-samples)
-          (/ (loop for i from 0 below n
-                   count (> (aref (control-ring-latencies ring) i) threshold-ms))
-             (float n 1d0))
           :too-few-samples))))

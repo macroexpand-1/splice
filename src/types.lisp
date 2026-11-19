@@ -56,7 +56,8 @@
   (min-effect 0.3d0)
   (stage-limit 40000)
   (stage :none)
-  control-ring
+  control-ring                       ; recent control outcomes, for the confound check
+  null-ring                          ; a longer control history the tests' nulls come from
   (confound-threshold 0.15)          ; control failure rate above this => FROZEN
   (runtime-contract-interval 200)    ; run contracts every N canary observations
   (pinned-new 0) (pinned-old 0)      ; in-flight task counts, per route

@@ -5,7 +5,7 @@
 ;;;;   sbcl --non-interactive --eval '(require :asdf)' \
 ;;;;        --eval '(asdf:load-asd (truename "splice.asd"))' \
 ;;;;        --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))' \
-;;;;        --eval '(asdf:test-system "splice-orders/criteria")'     ; full (~2-4 min)
+;;;;        --eval '(asdf:test-system "splice-orders/criteria")'     ; full (~15 min)
 ;;;;
 ;;;; SPLICE_RUNS=20 in the environment gives a quicker run. TEST-OP signals
 ;;;; an error when any criterion fails, so a non-interactive run exits
@@ -275,9 +275,11 @@ migrated forward mid-canary, then restored)"
     (let* ((k (batch-caught b))        ; every rollback of a clean patch is spurious
            (ci (wilson-ci k *runs*))
            (promoted (batch-count :promoted b)))
-      (check (format nil "C6: clean-patch spurious rollbacks ~a/~a, 95% CI [~,4f, ~,4f] contains alpha=0.01"
+      ;; alpha bounds a session's whole chance of a spurious rollback, so the
+      ;; realized rate only has to be no worse: the CI must reach down to alpha
+      (check (format nil "C6: clean-patch spurious rollbacks ~a/~a, 95% CI [~,4f, ~,4f] reaches alpha=0.01 or below"
                      k *runs* (first ci) (second ci))
-             (and (<= (first ci) 0.01) (<= 0.01 (second ci))
+             (and (<= (first ci) 0.01)
                   ;; and never via a nonsense route: a clean patch must mostly
                   ;; promote, and a frozen, vetoed or undecided session is not
                   ;; a promotion
