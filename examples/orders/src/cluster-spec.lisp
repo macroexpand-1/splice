@@ -66,5 +66,4 @@ the hash"
                      (funcall (splice:new 'splice-orders::price-order) o)
                      (= 1099 (funcall (splice:new 'splice-orders::total-invoice) o)))))))
    :ramp '(5 25 100)
-   :min-n 30
-   :max-n 2000))
+   :stage-limit 40000))

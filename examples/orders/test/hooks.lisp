@@ -103,7 +103,10 @@ SYMBOL is not evaluated."
     (with-global (splice::*drain-timeout-seconds* 60)
       (setf orders:*live-session* nil)
       (let* ((gate (sb-thread:make-semaphore))
+             ;; a set that catches 2x passes its stages in about 40000 tasks,
+             ;; inside the wait below; the default 1.3x takes about 350000
              (thread (session-thread :seed 1001 :threads 3 :quiet t :settle-timeout 90
+                                     :min-effect 1d0
                                      :pace (held-task-pace gate)))
              (ps (orders:live-session-patch-set (await-live-session 10))))
         (is (eq :promoting (splice:wait-for-state ps '(:promoting) :timeout 60)))
@@ -123,9 +126,13 @@ SYMBOL is not evaluated."
              (verdict (second (getf decision :trigger)))
              (step (first (last (remove-if-not
                                  (lambda (e) (< (getf e :seq) (getf decision :seq)))
-                                 (entries-of path :sprt-step))))))
-        (is (eql (getf verdict :n) (car (getf step :errors))))
-        (is (< (abs (- (getf verdict :llr) (cdr (getf step :errors)))) 1e-3))))))
+                                 (entries-of path :sprt-step)))))
+             ;; the step names the latency signal :slow
+             (point (getf step (ecase (getf verdict :signal)
+                                 (:errors :errors)
+                                 (:latency :slow)))))
+        (is (eql (getf verdict :n) (car point)))
+        (is (< (abs (- (getf verdict :log-odds) (cdr point))) 1e-3))))))
 
 (test a-drain-timeout-freezes-promotion
   (with-shared-log (path)

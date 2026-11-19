@@ -15,19 +15,31 @@
 ;;;;   3. Trace the splices. The audit log's hash chain is verified, the image
 ;;;;      state is reconstructed from the log alone, and tampering is
 ;;;;      detected.
+;;;;
+;;;; Exits 1 if any scenario ends other than as described, so CI can run it
+;;;; as a check.
 
 (require :asdf)
 (asdf:load-asd (merge-pathnames "../../../splice.asd" *load-truename*))
 (asdf:load-asd (merge-pathnames "../splice-orders.asd" *load-truename*))
-(asdf:load-system "splice-orders")
+(asdf:load-system "splice-orders/demo")
 
 (defpackage :splice-demo
   (:use :cl)
-  (:local-nicknames (#:orders #:splice-orders)))
+  (:local-nicknames (#:orders #:splice-orders) (#:d #:splice-orders/demo)))
 (in-package :splice-demo)
 
 (defvar *log-path* (merge-pathnames "artifacts/demo-audit.log"
                                     (asdf:system-source-directory "splice-orders")))
+
+(defvar *failed-checks* '()
+  "The labels of every expectation that didn't hold, latest first")
+
+(defun expect (label holds)
+  "Record LABEL as failed unless HOLDS. Returns HOLDS"
+  (unless holds
+    (push label *failed-checks*))
+  holds)
 
 (defun headline (fmt &rest args)
   (format t "~%~a~%~a~%" (apply #'format nil fmt args)
@@ -44,6 +56,8 @@
 (headline "1. Splice in: clean patch, canary ramp 5% -> 25% -> 100% -> promoted")
 
 (let ((r (orders:run-canary-session :fault nil :seed 1001 :quiet t)))
+  (expect "the clean patch set promotes"
+          (eq :promoted (orders:session-result-final-state r)))
   (format t "final state: ~a after ~a tasks~%"
           (orders:session-result-final-state r) (orders:session-result-tasks-run r))
   (format t "lifecycle:   ~{~a~^ -> ~}~%"
@@ -63,6 +77,8 @@
 
 (format t "fault: ~a~%~%" (orders:fault-description :latent))
 (let ((r (orders:run-canary-session :fault :latent :seed 2002 :quiet t)))
+  (expect "the faulty patch set rolls back"
+          (eq :rolled-back (orders:session-result-final-state r)))
   (format t "final state: ~a after ~a tasks~%"
           (orders:session-result-final-state r) (orders:session-result-tasks-run r))
   (format t "lifecycle:   ~{~a~^ -> ~}~%"
@@ -91,27 +107,23 @@ class has no minor-units slot: ~a)~%"
 (splice:close-audit-log)
 
 (multiple-value-bind (ok entry-count) (splice:verify-audit-chain *log-path*)
+  (expect "the audit log's chain verifies" ok)
   (format t "hash chain intact over ~a entries: ~a~%" entry-count ok))
 
 (multiple-value-bind (ok mismatches state) (splice:verify-reconstruction *log-path*)
   (declare (ignore state))
+  (expect "state rebuilt from the log matches the image" ok)
   (format t "state reconstructed from log matches live image: ~a~a~%"
           ok (if mismatches (format nil " (~a)" mismatches) "")))
 
 ;; tamper with a copy; the chain must break
-(let ((tampered (merge-pathnames "splice-demo-audit-tampered.log"
-                                 (uiop:temporary-directory))))
-  (with-open-file (in *log-path*)
-    (with-open-file (out tampered :direction :output :if-exists :supersede)
-      (loop for line = (read-line in nil) while line
-            for i from 0
-            do (write-line (if (= i 40)
-                               (substitute #\9 #\1 line :count 1)
-                               line)
-                           out))))
-  (multiple-value-bind (ok entry-count break-seq) (splice:verify-audit-chain tampered)
-    (declare (ignore entry-count))
-    (format t "tampered copy detected: intact=~a, chain breaks at seq ~a~%"
-            ok break-seq)))
+(let ((result (d:call-with-tampered-copy *log-path* #'d:chain-result)))
+  (expect "the tampered copy fails to verify" (not (getf result :ok)))
+  (format t "tampered copy detected: intact=~a, chain breaks at seq ~a~%"
+          (getf result :ok) (getf result :break-seq)))
 
-(format t "~%demo complete.~%")
+(cond (*failed-checks*
+       (format t "~%demo FAILED: ~{~a~^; ~}~%" (reverse *failed-checks*))
+       (uiop:quit 1))
+      (t
+       (format t "~%demo complete.~%")))

@@ -19,8 +19,7 @@
 (defun timeout-probe-set (name)
   "Healthy set whose first outcome times the stage out."
   (let ((ps (healthy-probe-set name)))
-    (setf (splice::patch-set-sprt-min-n ps) 1
-          (splice::patch-set-sprt-max-n ps) 1)
+    (setf (splice::patch-set-stage-limit ps) 1)
     ps))
 
 (test outside-the-macro-a-reject-is-settled-by-splice
@@ -39,14 +38,14 @@
       (let ((seen (list '()))
             (while-asked nil))
         (splice:with-operator-decisions
-          (handler-bind ((splice:operator-decision
-                           (lambda (c)
-                             (push c (car seen))
-                             (setf while-asked
-                                   (list (splice:patch-set-state ps)
-                                         (first (splice::patch-set-freeze-reason ps))))
-                             (splice:roll-back-patch c))))
-            (drive-tasks (lambda () (car seen)))))
+            (handler-bind ((splice:operator-decision
+                             (lambda (c)
+                               (push c (car seen))
+                               (setf while-asked
+                                     (list (splice:patch-set-state ps)
+                                           (first (splice::patch-set-freeze-reason ps))))
+                               (splice:roll-back-patch c))))
+              (drive-tasks (lambda () (car seen)))))
         (let ((decision (first (car seen))))
           (is (= 1 (length (car seen))))
           (is (eq :sprt-reject (splice:operator-decision-point decision)))
@@ -68,8 +67,8 @@
     (unwind-protect
          (with-installed-set (ps (failing-probe-set 'promote-over-reject))
            (splice:with-operator-decisions
-             (handler-bind ((splice:operator-decision #'splice:promote-anyway))
-               (drive-tasks (canary-ended-p ps))))
+               (handler-bind ((splice:operator-decision #'splice:promote-anyway))
+                 (drive-tasks (canary-ended-p ps))))
            (is (eq :promoted (splice:wait-for-state ps '(:promoted) :timeout 15)))
            (join-lifecycle-threads ps)
            (is (search '(:canary-100 :frozen :promoting :swapping :promoted)
@@ -81,9 +80,9 @@
   (with-installed-set (ps (healthy-probe-set 'held-accept))
     (let ((seen (list '())))
       (splice:with-operator-decisions
-        (handler-bind ((splice:operator-decision (choosing #'splice:let-splice-decide seen)))
-          (drive-tasks (lambda () (car seen)))))
-      (is (eq :sprt-accept (splice:operator-decision-point (first (car seen)))))
+          (handler-bind ((splice:operator-decision (choosing #'splice:let-splice-decide seen)))
+            (drive-tasks (lambda () (car seen)))))
+      (is (eq :budget-pass (splice:operator-decision-point (first (car seen)))))
       (is (eq :advance (splice:operator-decision-default (first (car seen)))))
       (is (eq :canary-100 (splice:patch-set-state ps)))
       (is (search '(:canary-50 :frozen :canary-100) (state-trail ps))
@@ -93,8 +92,8 @@
   (with-installed-set (ps (timeout-probe-set 'held-timeout))
     (let ((seen (list '())))
       (splice:with-operator-decisions
-        (handler-bind ((splice:operator-decision (choosing #'splice:freeze-patch seen)))
-          (drive-tasks (lambda () (car seen)))))
+          (handler-bind ((splice:operator-decision (choosing #'splice:freeze-patch seen)))
+            (drive-tasks (lambda () (car seen)))))
       (let ((reason (splice::patch-set-freeze-reason ps)))
         (is (eq :stage-timeout (splice:operator-decision-point (first (car seen)))))
         (is (eq :frozen (splice:patch-set-state ps)))
@@ -112,16 +111,16 @@
                              (sb-thread:make-thread
                               (lambda ()
                                 (splice:with-operator-decisions
-                                  (handler-bind ((splice:operator-decision
-                                                   (lambda (c)
-                                                     (sb-thread:with-mutex (lock)
-                                                       (push c seen))
-                                                     (sleep 0.2)
-                                                     (splice:roll-back-patch c))))
-                                    (loop for id from first-id below (+ first-id 500)
-                                          while (splice::canary-stage-p (splice:patch-set-state ps))
-                                          do (splice:with-task (:id id :swallow-errors t)
-                                               (funcall 'lifecycle-probe id))))))
+                                    (handler-bind ((splice:operator-decision
+                                                     (lambda (c)
+                                                       (sb-thread:with-mutex (lock)
+                                                         (push c seen))
+                                                       (sleep 0.2)
+                                                       (splice:roll-back-patch c))))
+                                      (loop for id from first-id below (+ first-id 500)
+                                            while (splice::canary-stage-p (splice:patch-set-state ps))
+                                            do (splice:with-task (:id id :swallow-errors t)
+                                                 (funcall 'lifecycle-probe id))))))
                               :name (format nil "decision-worker-~d" w))))))
       (mapc #'sb-thread:join-thread workers)
       (is (= 1 (length seen)))
@@ -133,29 +132,29 @@
   (with-installed-set (ps (failing-probe-set 'lock-free-ask))
     (let ((checks '()))
       (splice:with-operator-decisions
-        (handler-bind ((splice:operator-decision
-                         (lambda (c)
-                           (push (sb-thread:holding-mutex-p (splice::patch-set-lock ps))
-                                 checks)
-                           (let ((other (sb-thread:make-thread
-                                         (lambda ()
-                                           (splice::with-set-lock (ps) :took-it)))))
-                             (push (sb-thread:join-thread other :default :timed-out
-                                                                :timeout 5)
-                                   checks))
-                           (splice:roll-back-patch c))))
-          (drive-tasks (canary-ended-p ps))))
+          (handler-bind ((splice:operator-decision
+                           (lambda (c)
+                             (push (sb-thread:holding-mutex-p (splice::patch-set-lock ps))
+                                   checks)
+                             (let ((other (sb-thread:make-thread
+                                           (lambda ()
+                                             (splice::with-set-lock (ps) :took-it)))))
+                               (push (sb-thread:join-thread other :default :timed-out
+                                                                  :timeout 5)
+                                     checks))
+                             (splice:roll-back-patch c))))
+            (drive-tasks (canary-ended-p ps))))
       (is (equal '(:took-it nil) checks)))))
 
 (test a-choice-after-someone-else-moved-the-set-is-abandoned
   (with-audit-log (path)
     (with-installed-set (ps (failing-probe-set 'abandoned-choice))
       (splice:with-operator-decisions
-        (handler-bind ((splice:operator-decision
-                         (lambda (c)
-                           (splice:unfreeze ps :rollback :operator "unit-tests")
-                           (splice:promote-anyway c))))
-          (drive-tasks (canary-ended-p ps))))
+          (handler-bind ((splice:operator-decision
+                           (lambda (c)
+                             (splice:unfreeze ps :rollback :operator "unit-tests")
+                             (splice:promote-anyway c))))
+            (drive-tasks (canary-ended-p ps))))
       (is (eq :rolled-back (splice:wait-for-state ps '(:rolled-back) :timeout 15)))
       (join-lifecycle-threads ps)
       (is (not (member :promoting (state-trail ps))) "trail was ~s" (state-trail ps))
@@ -172,7 +171,7 @@
       (let ((sb-ext:*invoke-debugger-hook* hook)
             (*debugger-hook* hook))
         (splice:with-operator-decisions
-          (drive-tasks (canary-ended-p ps))))
+            (drive-tasks (canary-ended-p ps))))
       (is (= 1 (length entered)))
       (is (typep (first entered) 'splice:operator-decision))
       (is (eq :rolled-back (splice:wait-for-state ps '(:rolled-back) :timeout 15))))))

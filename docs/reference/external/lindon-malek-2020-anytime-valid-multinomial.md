@@ -12,7 +12,7 @@ It builds a sequential test on counts that can be monitored after every observat
 Its Section 2 is a Dirichlet-multinomial mixture of likelihood ratios that rejects when the posterior odds reach `1/u` (Theorem 2.2).
 Its Section 3 applies that test to arms receiving units with fixed assignment probabilities and a shared, time-varying base rate.
 The arm each event comes from is then a multinomial draw that depends only on the assignment probabilities and the arms' log rate ratios (equation 12), so the time-varying rate drops out.
-Splice's canary verdicts (decision `0014`, canary-statistics guide 02) take their formulas from these two sections.
+Splice's canary verdicts (`src/sprt.lisp`) take their formulas from these two sections.
 Lindon, Sanden and Shirikian (KDD 2022), pinned beside this file, cite it as their reference 15.
 
 ## Why the Paper Is Not Vendored

@@ -14,7 +14,7 @@
  :canary-born (:old 912 :new 47)
  :threads ((:name "demo-session" :pins ())
            (:name "splice-rollback-CURRENCY-MIGRATION" :pins ()))
- :sprt (:stage 0 :trimmed nil :upper 4.553877 :lower -2.985682 :min-n 50
+ :sprt (:stage 0 :trimmed nil :upper 5.2983174 :budget 9004
         :errors ((1 . -0.020223137) (2 . -0.040446274) (3 . -0.060669407) (4 . 2.983853) (5 . 2.96363)
                  (6 . 2.9434068) (7 . 2.9231837) (8 . 2.9029605) (9 . 2.8827374) (10 . 5.92726)
                  (11 . 5.907037) (12 . 5.8868136) (13 . 8.931336) (14 . 8.911113) (15 . 8.89089)

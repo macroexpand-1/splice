@@ -21,9 +21,13 @@
 (defun on-new-window (body)
   "Build one tab's page, put it into the registry, and drop it when the tab closes."
   (build-page body)
+  (run-registered body))
+
+(defun run-registered (body)
+  "Run BODY's page with BODY in the registry, and forget it however clog:run exits"
   (register-connection body)
-  (clog:run body)
-  (forget-connection body))
+  (unwind-protect (clog:run body)
+    (forget-connection body)))
 
 (defun build-page (body)
   "Lay out BODY and wire its buttons. Runs on the tab's connection thread, before registering"
@@ -80,10 +84,10 @@
     (dolist (script scripts)
       (clog:js-execute body script))))
 
-(defun deliver (body scripts snapshot)
-  "Send SCRIPTS to BODY and remember SNAPSHOT as what it shows.
-:sent or :failed"
-  (handler-case (progn (send-frame body scripts)
+(defun deliver (body render snapshot)
+  "Send the scripts RENDER/0 returns to BODY and remember SNAPSHOT as what it shows.
+RENDER runs here, so its error fails only this page. :sent or :failed"
+  (handler-case (progn (send-frame body (funcall render))
                        (remember-snapshot body snapshot)
                        :sent)
     (error ()
@@ -93,7 +97,9 @@
 (defun write-frame (snapshot)
   "The sink: bring every open page up to SNAPSHOT. Return how many pages took it"
   (count :sent (mapcar (lambda (entry)
-                         (deliver (car entry) (d:render-frame (cdr entry) snapshot) snapshot))
+                         (deliver (car entry)
+                                  (lambda () (d:render-frame (cdr entry) snapshot))
+                                  snapshot))
                        (live-connections))))
 
 ;;; ---------------------------------------------------------------------
@@ -116,7 +122,7 @@ when that thread did not join and may be still writing"
 
 (defun send-to-pages (script)
   "Send SCRIPT to every open page from this thread. Each page's next frame is a full one"
-  (count :sent (mapcar (lambda (entry) (deliver (car entry) (list script) nil))
+  (count :sent (mapcar (lambda (entry) (deliver (car entry) (lambda () (list script)) nil))
                        (live-connections))))
 
 (defun show-chain-check (path)
@@ -132,7 +138,8 @@ Returns the chain-result plist, or what stop-frame-sources said when it didn't s
 Returns the copy's chain-result plist, or what stop-frame-sources said when it didn't stop"
   (let ((stopped (stop-frame-sources)))
     (if (eq :stopped stopped)
-        (draw-chain-check "A copy with one digit changed" (d:chain-result (d:tamper-copy path))
+        (draw-chain-check "A copy with one digit changed"
+                          (d:call-with-tampered-copy path #'d:chain-result)
                           "Reconstruction runs only on the original log")
         stopped)))
 

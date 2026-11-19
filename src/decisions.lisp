@@ -119,7 +119,7 @@
   (ecase point
     (:sprt-reject "an SPRT reject")
     (:runtime-contract "a failing runtime contract")
-    (:sprt-accept "an SPRT accept")
+    (:budget-pass "a stage budget pass")
     (:stage-timeout "a stage timeout")
     (:confounded "a confounded control arm")))
 

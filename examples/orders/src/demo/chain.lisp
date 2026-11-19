@@ -35,13 +35,26 @@ doesn't read is itself the bad entry; the anchor reasons name no entry"
         "State rebuilt from the log matches the live image"
         (format nil "State rebuilt from the log differs in ~d place~:p" (length mismatches)))))
 
-(defun tamper-copy (path &key (line 40))
-  "Copy the log at PATH to temp directory with one digit changed on LINE.
-Returns the copy's path - PATH is read only."
-  (let ((copy (merge-pathnames "splice-demo-audit-tampered.log" (uiop:temporary-directory))))
-    (with-open-file (in path)
-      (with-open-file (out copy :direction :output :if-exists :supersede)
-        (loop for text = (read-line in nil) while text
-              for i from 0
-              do (write-line (if (= i line) (substitute #\9 #\1 text :count 1) text) out))))
-    copy))
+(defun call-with-tampered-copy (path fn &key (line 40))
+  "Call FN with the path of a copy of the log at PATH that has one digit changed
+on LINE. The copy has a fresh name and is deleted afterwards; PATH is only read.
+Returns what FN returns."
+  (let ((copy (fresh-temp-path "splice-demo-tampered")))
+    (unwind-protect
+         (progn (write-tampered-copy path copy line)
+                (funcall fn copy))
+      (uiop:delete-file-if-exists copy))))
+
+(defun fresh-temp-path (prefix)
+  "A path in the temp directory named PREFIX plus a random number, so two runs
+on one machine never share it"
+  (merge-pathnames (format nil "~a-~d.log" prefix
+                           (random most-positive-fixnum (make-random-state t)))
+                   (uiop:temporary-directory)))
+
+(defun write-tampered-copy (path copy line)
+  (with-open-file (in path)
+    (with-open-file (out copy :direction :output :if-exists :error)
+      (loop for text = (read-line in nil) while text
+            for i from 0
+            do (write-line (if (= i line) (substitute #\9 #\1 text :count 1) text) out)))))

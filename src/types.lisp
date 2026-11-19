@@ -7,32 +7,41 @@
 ;;; Structs and registry
 
 (defstruct fn-patch
-  name            ; symbol naming the function
-  new-fn          ; compiled new implementation
-  new-source      ; source form of the new implementation (for the audit log)
-  new-source-hash
+  (name nil :read-only t)            ; symbol naming the function
+  (new-fn nil :read-only t)          ; compiled new implementation
+  (new-source nil :read-only t)      ; source form of the new implementation (for the audit log)
+  (new-source-hash nil :read-only t)
+  ;; mutable
   old-fn          ; captured original fdefinition (in case of rollback)
   old-source-hash ; hash of the original's identity (printed repr)
   shim)           ; installed dispatch shim, while in canary
 
 (defstruct method-patch
-  gf-name qualifiers specializer-names
-  new-fn new-source new-source-hash
+  (gf-name nil :read-only t)
+  (qualifiers nil :read-only t)
+  (specializer-names nil :read-only t)
+  (new-fn nil :read-only t)
+  (new-source nil :read-only t)
+  (new-source-hash nil :read-only t)
+  ;; mutable
   old-method      ; captured method object (add-method'd back on rollback)
   shim-method)    ; installed routing method, while in canary
 
 (defstruct class-patch
-  class-name
-  add-slots       ; defclass-style slot specs to add
-  drop-slots      ; slot names dropped by the new shape (retained during canary)
-  migrate-forward ; (instance old-values-plist) -> populates new slots
-  migrate-backward; (instance new-values-plist) -> synthesizes old slots
-  lossy-p         ; author declares reversal lossy => rollback needs a human
+  (class-name nil :read-only t)
+  (add-slots nil :read-only t)        ; defclass-style slot specs to add
+  (drop-slots nil :read-only t)       ; slot names dropped by the new shape (retained during canary)
+  (migrate-forward nil :read-only t)  ; (instance old-values-plist) -> populates new slots
+  (migrate-backward nil :read-only t) ; (instance new-values-plist) -> synthesizes old slots
+  (lossy-p nil :read-only t)          ; author declares reversal lossy => rollback needs a human
+  ;; mutable
   old-slot-specs  ; captured canonicalized direct-slot specs of the original
   old-superclass-names)
 
 (defstruct contract
-  name check-fn source)
+  (name nil :read-only t)
+  (check-fn nil :read-only t)
+  (source nil :read-only t))
 
 (defstruct (patch-set (:print-object print-patch-set))
   name description ticket

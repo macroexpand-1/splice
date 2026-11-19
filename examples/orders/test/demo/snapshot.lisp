@@ -17,6 +17,16 @@
     (simple-vector (every #'plain-data-p form))
     (t nil)))
 
+(defun same-data-p (a b)
+  "True when A and B are the same plain data: EQUAL on atoms and strings, so case
+and 25 against 25.0 both count, walking conses and simple vectors"
+  (typecase a
+    (cons (and (consp b) (same-data-p (car a) (car b)) (same-data-p (cdr a) (cdr b))))
+    (simple-vector (and (simple-vector-p b)
+                        (= (length a) (length b))
+                        (every #'same-data-p a b)))
+    (t (equal a b))))
+
 (defun round-trip (form)
   (with-input-from-string (in (with-output-to-string (out) (d:write-snapshot form out)))
     (d:read-snapshot in)))
@@ -27,14 +37,14 @@
 (defun walk-after (walk steps &key (tail :complete))
   "WALK folded with STEPS as one frame with the act 2 bounds"
   (d::next-sprt walk (list :sprt-steps steps :tail tail
-                           :bounds '(:upper 4.553877 :lower -2.985682 :min-n 50))))
+                           :bounds '(:upper 5.2983174 :budget 9004))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Fixtures
 
 (test fixtures-round-trip
   (dolist (snapshot (all-fixtures))
-    (is (equalp snapshot (round-trip snapshot)))))
+    (is (same-data-p snapshot (round-trip snapshot)))))
 
 (test fixtures-hold-plain-data
   (dolist (snapshot (all-fixtures))
@@ -50,7 +60,7 @@
                                 (sprt-step-entry 0 '(2 . 3.02) '(0 . 0.0))))))
     (is (equal '((1 . -0.02) (2 . 3.02)) (getf walk :errors)))
     (is (equal '() (getf walk :slow)))
-    (is (= 50 (getf walk :min-n)))))
+    (is (= 9004 (getf walk :budget)))))
 
 (test fold-new-stage-starts-over
   (let* ((stage-0 (walk-after (d::start-walk 0)

@@ -20,8 +20,8 @@
 ;;; ---------------------------------------------------------------------
 ;;; Operator handlers re-entering the lifecycle
 
-(test a-verdict-handler-can-freeze-after-an-accept
-  (with-installed-set (ps (healthy-probe-set 'accept-then-freeze))
+(test a-verdict-handler-can-freeze-after-a-pass
+  (with-installed-set (ps (healthy-probe-set 'pass-then-freeze))
     (let* ((seen (list '()))
            (escaped (escaped-error
                      (lambda ()
@@ -29,7 +29,7 @@
                          (drive-tasks (lambda () (car seen))))))))
       (is (eq :none escaped) "~a escaped the task" escaped)
       (is (= 1 (length (car seen))))
-      (is (eq :accept (splice:canary-verdict-direction (first (car seen)))))
+      (is (eq :pass (splice:canary-verdict-direction (first (car seen)))))
       (is (search '(:canary-50 :canary-100 :frozen) (state-trail ps))
           "trail was ~s" (state-trail ps))
       (is (eq :frozen (splice:patch-set-state ps)))
@@ -110,3 +110,15 @@
     (signals splice:illegal-transition (splice:seal-patch ps :operator "unit-tests"))
     (is-false (splice::patch-set-sealed ps))
     (is (eq :canary-50 (splice:patch-set-state ps)))))
+
+(test unfreezing-a-set-that-is-not-frozen-is-refused
+  (with-installed-set (ps (healthy-probe-set 'unfreeze-unfrozen))
+    (signals splice:illegal-transition (splice:unfreeze ps :resume :operator "unit-tests"))
+    (is (eq :canary-50 (splice:patch-set-state ps)))))
+
+(test an-unknown-unfreeze-decision-leaves-the-set-frozen
+  (with-installed-set (ps (healthy-probe-set 'unfreeze-bad-decision))
+    (splice:freeze ps "operator hold" :operator "unit-tests")
+    (signals splice:illegal-transition (splice:unfreeze ps :sideways :operator "unit-tests"))
+    (is (eq :frozen (splice:patch-set-state ps)))
+    (is-true (splice::patch-set-freeze-reason ps))))

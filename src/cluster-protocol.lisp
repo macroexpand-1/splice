@@ -17,7 +17,8 @@
 ;;;;
 ;;;; Limitations:
 ;;;; - contracts run at COMMIT (inside INSTALL), not PREPARE.
-;;;; - members ramp independently; the conductor gates only rollback (T3).
+;;;; - members ramp and promote independently; the conductor gates only
+;;;;   rollback, never promotion.
 ;;;; - no partition handling and no timeouts; a transport reports a dead
 ;;;;   link as (:gone).
 
@@ -145,8 +146,7 @@ or PATCH-VETOED when a static check refuses."
             :name (intern (spec-field spec :name) package)
             :description (getf spec :description)
             :ramp (spec-field spec :ramp)
-            :sprt-min-n (spec-field spec :min-n)
-            :sprt-max-n (spec-field spec :max-n)
+            :stage-limit (spec-field spec :stage-limit)
             :fn-patches (mapcar (lambda (entry) (spec-fn-patch entry package))
                                 (getf spec :functions))
             :class-patches (mapcar (lambda (entry) (spec-class-patch entry package))
@@ -201,9 +201,10 @@ or PATCH-VETOED when a static check refuses."
                 :rollback-sent rollback-sent))
 
 (defun empty-cluster (alpha beta)
-  "Cluster wiht no members, whose pooled SPRT rejects at Wald's upper
-for ALPHA and BETA (as each member's SPRT does)"
-  (make-cluster :upper-milli (round (* 1000 (log (/ (- 1d0 beta) alpha))))))
+  "Cluster with no members, whose pooled error test rejects at 2/ALPHA (as
+each member's does). BETA sizes stage budgets, not this threshold."
+  (declare (ignore beta))
+  (make-cluster :upper-milli (round (* 1000 (log (/ 2d0 alpha))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Reading and rebuilding the value
@@ -650,13 +651,14 @@ the conductor gates only rollback"
                            extra)))))
 
 (defun health-message (ps)
-  "PS's error SPRT as a :HEALTH message, with the LLR in thousandths"
-  (let ((sprt (splice::patch-set-sprt-error ps)))
+  "PS's error test as a :HEALTH message, with the log odds in thousandths"
+  (let ((stage (splice::patch-set-stage ps)))
     (list :health
           :state (splice:patch-set-state ps)
           :fraction (splice::patch-set-current-fraction ps)
-          :n (splice:sprt-n sprt)
-          :llr-milli (round (* 1000 (splice:sprt-llr sprt))))))
+          :n (splice::canary-stage-observations stage)
+          :llr-milli (round (* 1000 (splice:mixture-log-odds
+                                     (splice::canary-stage-error-test stage)))))))
 
 (defun member-send-health (cluster-member)
   "Send the conductor the member's current SPRT health. The host's workload

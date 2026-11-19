@@ -110,17 +110,34 @@ would be the sampler's."
       (is (equal (mapcar #'car (orders:session-result-transitions quiet))
                  (mapcar #'car (orders:session-result-transitions sampled)))))))
 
+(defun broken-session ()
+  "A live session with no patch set, so reading a frame from it signals."
+  (orders::make-live-session
+   :patch-set nil :orders '() :started 1 :audit-start-seq 0
+   :pacer (orders::make-pacer)))
+
 (test an-unreadable-frame-is-skipped
-  (let ((broken (orders::make-live-session
-                 :patch-set nil :orders '() :started 1 :audit-start-seq 0
-                 :pacer (orders::make-pacer)))
-        (snapshot (d:empty-snapshot))
-        (called nil))
+  (let* ((broken (broken-session))
+         (orders:*live-session* broken)
+         (snapshot (d:empty-snapshot))
+         (called nil))
     (multiple-value-bind (next faults)
         (d::sample-session snapshot '() broken
                            (list (lambda (s) (setf called s))))
       (is (eq snapshot next))
       (is (= 1 (length faults)))
+      (is (null called)))))
+
+(test a-withdrawn-sessions-fault-is-dropped
+  "A read that fails after its session was withdrawn carries no fault into the next act."
+  (let ((orders:*live-session* nil)
+        (snapshot (d:empty-snapshot))
+        (called nil))
+    (multiple-value-bind (next faults)
+        (d::sample-session snapshot '("older") (broken-session)
+                           (list (lambda (s) (setf called s))))
+      (is (eq snapshot next))
+      (is (equal '("older") faults))
       (is (null called)))))
 
 (test between-sessions-calls-no-sink
@@ -161,6 +178,19 @@ would be the sampler's."
       (d::collect-newer '("(:seq 105)" "(:seq 104)") 50)
     (is (= 2 (length entries)))
     (is (eq :trimmed status))))
+
+(test detection-reads-the-lines-under-the-lock
+  "Detection waits for the log's lock, since AUDIT trims the lines in place."
+  (with-demo-log (path)
+    (declare (ignore path))
+    (let* ((lock (splice::audit-log-lock splice:*audit-log*))
+           (reader nil))
+      (sb-thread:with-mutex (lock)
+        (setf reader (sb-thread:make-thread #'orders::detection-observations-from-audit
+                                            :name "test-detection"))
+        (sleep 0.2)
+        (is (sb-thread:thread-alive-p reader)))
+      (is (eq :no-sprt-reject (sb-thread:join-thread reader :default :not-joined :timeout 5))))))
 
 (test classify-order-states
   (is (eq :pending (d::classify-order t t)))

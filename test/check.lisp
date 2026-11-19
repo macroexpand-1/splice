@@ -11,7 +11,7 @@
 ;;;;
 ;;;; The criteria run 100 times per fault class, about 2 to 4 minutes. C7 is
 ;;;; a timing check (the canary shim must cost under 2x a plain call, 1.37x
-;;;; locally), so it is the likeliest to flake on a noisy machine (T106).
+;;;; locally), so it is the likeliest to flake on a noisy machine.
 
 (require :asdf)
 
@@ -62,7 +62,7 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
   (list (test-check "splice")
         (test-check "splice/cluster")
         ;; Checks that the transport compiles, and that the protocol loads
-        ;; without the orders example. No test opens a socket (T104).
+        ;; without the orders example. No test opens a socket yet.
         (load-check "splice/cluster-tcp")
         (test-check "splice/integration-tests")
         (test-check "splice-orders/tests")

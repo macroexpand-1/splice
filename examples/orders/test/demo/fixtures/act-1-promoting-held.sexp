@@ -14,7 +14,7 @@
  :canary-born (:old 2376 :new 404)
  :threads ((:name "orders-straggler" :pins ((orders::currency-migration . :old)))
            (:name "splice-promote-CURRENCY-MIGRATION" :pins ()))
- :sprt (:stage 2 :trimmed nil :upper 4.553877 :lower -2.985682 :min-n 50
+ :sprt (:stage 2 :trimmed nil :upper 5.2983174 :budget 9136
         :errors ((1 . -0.020223137) (2 . -0.040446274) (3 . -0.06066941) (4 . -0.08089255) (5 . -0.10111569)
                  (6 . -0.12133882) (7 . -0.14156196) (8 . -0.1617851) (9 . -0.18200824) (10 . -0.20223138)
                  (11 . -0.2224545) (12 . -0.24267764) (13 . -0.26290077) (14 . -0.2831239) (15 . -0.30334705)

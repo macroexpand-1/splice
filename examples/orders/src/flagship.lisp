@@ -62,7 +62,8 @@
                         :discount-code code))
 
 (defun register-currency-patch-set (&key (ramp '(5 25 100)) (alpha 0.01d0)
-                                      (beta 0.05d0) (min-n 50) (max-n 2000)
+                                      (beta 0.05d0) (min-effect 0.3d0)
+                                      (stage-limit 40000)
                                       paired-fallback lossy)
   "Register a fresh flagship patch set. Faults come from *FAULT*, so one set
 serves every session."
@@ -73,7 +74,7 @@ serves every session."
     :description "orders: float dollars -> rational minor units"
     :ticket "SPLICE-42"
     :ramp ramp :alpha alpha :beta beta
-    :sprt-min-n min-n :sprt-max-n max-n
+    :min-effect min-effect :stage-limit stage-limit
     :paired-fallback paired-fallback
     :fn-patches
     (list (splice::make-fn-patch

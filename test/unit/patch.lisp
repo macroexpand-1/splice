@@ -15,6 +15,22 @@
 (defun probe-two (a b) (list a b))
 (defun probe-keyed (x &key verbose) (list x verbose))
 
+(defclass shim-probe () ())
+(defgeneric shim-probe-answer (x))
+(defmethod shim-probe-answer ((x shim-probe)) :old)
+
+(defun method-patch-set (set-name gf-name specializer-names)
+  "An unregistered patch set replacing GF-NAME's method on SPECIALIZER-NAMES"
+  (splice::make-patch-set
+   :name set-name
+   :ramp '(50)
+   :method-patches (list (splice::make-method-patch
+                          :gf-name gf-name
+                          :specializer-names specializer-names
+                          :new-fn (lambda (x) (declare (ignore x)) :new)
+                          :new-source (list gf-name :new)
+                          :new-source-hash (splice:sha256-hex (string gf-name))))))
+
 (defun unreadable-probe ()
   "A two-argument function whose lambda list (debug 0) leaves unrecorded"
   (compile nil '(lambda (a b)
@@ -163,6 +179,68 @@
                                              (lambda (x) x)))))
       (is (eq :static-missing (splice:patch-vetoed-contract veto))))))
 
+(test a-method-patch-on-an-undefined-generic-function-is-vetoed
+  (with-patch-set-names (no-gf)
+    (let* ((ps (method-patch-set 'no-gf 'no-such-generic-anywhere '(shim-probe)))
+           (veto (register-veto ps)))
+      (is (eq :static-missing (splice:patch-vetoed-contract veto)))
+      (is (search "NO-SUCH-GENERIC-ANYWHERE" (splice:patch-vetoed-detail veto)))
+      (is (eq :vetoed (splice:patch-set-state ps))))))
+
+(test a-method-patch-on-an-undefined-class-is-vetoed
+  (with-patch-set-names (no-class)
+    (let ((veto (register-veto (method-patch-set 'no-class 'shim-probe-answer
+                                                 '(no-such-class-anywhere)))))
+      (is (eq :static-missing (splice:patch-vetoed-contract veto)))
+      (is (search "NO-SUCH-CLASS-ANYWHERE" (splice:patch-vetoed-detail veto))))))
+
+(test registering-over-a-live-set-of-the-same-name-is-vetoed
+  (with-patch-set-names (same-name)
+    (let ((live (fn-patch-set 'same-name 'probe-one (lambda (x) x))))
+      (splice:register-patch-set live)
+      (setf (splice:patch-set-state live) :canary-50)
+      (let ((veto (register-veto (fn-patch-set 'same-name 'probe-one (lambda (x) x)))))
+        (is (eq :static-name-in-use (splice:patch-vetoed-contract veto)))
+        (is (eq live (splice:find-patch-set 'same-name))))
+      (setf (splice:patch-set-state live) :rolled-back)
+      (is (eq :no-veto (register-veto (fn-patch-set 'same-name 'probe-one
+                                                    (lambda (x) x))))))))
+
+(test removing-method-shims-swaps-the-old-method-back-in-one-step
+  (with-patch-set-names (shim-swap)
+    (let ((ps (method-patch-set 'shim-swap 'shim-probe-answer '(shim-probe)))
+          (gf #'shim-probe-answer))
+      (splice:register-patch-set ps)
+      (splice::install-method-shims ps)
+      (is (= 1 (length (sb-mop:generic-function-methods gf))))
+      (is (equal '((shim-probe-answer (shim-probe))) (splice::unrestored-parts ps)))
+      (splice::remove-method-shims ps :world :old)
+      (is (null (splice::unrestored-parts ps)))
+      (is (= 1 (length (sb-mop:generic-function-methods gf))))
+      (is (eq :old (shim-probe-answer (make-instance 'shim-probe))))
+      (is (null (splice::method-patch-shim-method
+                 (first (splice::patch-set-method-patches ps))))))))
+
+(test a-ramp-that-falls-is-vetoed-at-registration
+  (with-patch-set-names (falling-ramp)
+    (let ((ps (fn-patch-set 'falling-ramp 'probe-one (lambda (x) x))))
+      (setf (splice::patch-set-ramp ps) '(25 5 100))
+      (let ((veto (register-veto ps)))
+        (is (eq :invalid-option (splice:patch-vetoed-contract veto)))
+        (is (search "ramp" (splice:patch-vetoed-detail veto)))
+        (is (eq :vetoed (splice:patch-set-state ps)))))))
+
+(test a-beta-with-no-z-score-is-vetoed-at-registration
+  (with-patch-set-names (odd-beta)
+    (let ((ps (fn-patch-set 'odd-beta 'probe-one (lambda (x) x))))
+      (setf (splice::patch-set-beta ps) 0.3d0)
+      (let ((veto (register-veto ps)))
+        (is (eq :invalid-option (splice:patch-vetoed-contract veto)))
+        (is (search "beta" (splice:patch-vetoed-detail veto)))))))
+
+(test the-default-options-pass-the-option-check
+  (is (eq :valid (splice::option-problem (splice::make-patch-set :name 'defaults)))))
+
 (test a-function-in-flight-in-another-set-is-vetoed
   (with-patch-set-names (overlap-first overlap-second)
     (splice:register-patch-set (fn-patch-set 'overlap-first 'probe-one (lambda (x) x)))
@@ -231,14 +309,15 @@
     (let ((ps (registered-with-contracts 'contracts-pass
                                          (contract 'one (lambda () t))
                                          (contract 'two (lambda () t)))))
-      (is (eq :pass (splice::run-contracts ps))))))
+      (is (eq :pass (splice::run-pre-flight-contracts ps)))
+      (is (eq :pass (splice::run-runtime-contracts ps))))))
 
 (test a-failing-pre-flight-contract-vetoes
   (with-patch-set-names (contracts-veto)
     (let* ((ps (registered-with-contracts 'contracts-veto
                                           (contract 'fine (lambda () t))
                                           (contract 'broken (lambda () nil))))
-           (veto (veto-of (lambda () (splice::run-contracts ps)))))
+           (veto (veto-of (lambda () (splice::run-pre-flight-contracts ps)))))
       (is (eq 'broken (splice:patch-vetoed-contract veto)))
       (is (eq :vetoed (splice:patch-set-state ps))))))
 
@@ -247,7 +326,7 @@
     (let ((ps (registered-with-contracts 'contracts-runtime
                                          (contract 'broken (lambda () nil)))))
       (is (equal '(:fail broken)
-                 (multiple-value-list (splice::run-contracts ps :phase :runtime))))
+                 (multiple-value-list (splice::run-runtime-contracts ps))))
       (is (eq :registered (splice:patch-set-state ps))))))
 
 (test contracts-run-outside-any-task
@@ -259,10 +338,10 @@
                                    (setf seen splice::*task-epochs*)
                                    t)))))
       (let ((splice::*task-epochs* (list (list ps :new))))
-        (splice::run-contracts ps))
+        (splice::run-pre-flight-contracts ps))
       (is (null seen)))))
 
-;;; T22: a contract veto has to reach the log as a veto, or the set
+;;; A contract veto has to reach the log as a veto, or the set
 ;;; reconstructs as :registered.
 
 (test a-contract-veto-reconstructs-as-vetoed
@@ -270,7 +349,7 @@
     (with-audit-log (path)
       (let ((ps (registered-with-contracts 'contracts-logged
                                            (contract 'broken (lambda () nil)))))
-        (veto-of (lambda () (splice::run-contracts ps)))
+        (veto-of (lambda () (splice::run-pre-flight-contracts ps)))
         (is (eq :vetoed (cdr (assoc 'contracts-logged
                                     (getf (splice:reconstruct-state path) :sets)))))
         (is (equal '(:veto)

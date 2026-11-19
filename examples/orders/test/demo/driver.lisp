@@ -10,6 +10,18 @@
   (is (= 200 (getf (d::act-settings 2) :pre-existing)))
   (is (= 120 (getf (d::act-settings 1) :drain))))
 
+(test an-act-refuses-to-start-without-pre-flight
+  (let ((d::*session-thread* nil))
+    (let ((d:*demo-log-path* nil))
+      (is (eq :no-audit-log (d:start-act 1 '()))))
+    (let ((d:*demo-log-path* #p"/tmp/never-opened.log")
+          (splice:*audit-log* nil))
+      (is (eq :no-audit-log (d:start-act 1 '()))))
+    (with-demo-log (path)
+      (let ((d:*demo-log-path* path)
+            (splice::*audit-sprt-steps* nil))
+        (is (eq :sprt-steps-off (d:start-act 1 '())))))))
+
 (test refuse-over-live-session
   (let* ((gate d:*gate*)
          (recorder d::*recorder*)

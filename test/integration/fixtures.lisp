@@ -22,20 +22,20 @@
 (defun lifecycle-probe (x) x)
 
 (defun failing-probe-set (name)
-  "Every task canaries and every canary fails, so the error SPRT rejects at
-its observation floor."
+  "Every task canaries and every canary fails, so the one-sample error test
+rejects within a few observations."
   (let ((ps (fn-patch-set name 'lifecycle-probe
                           (lambda (x) (error "canary broke on ~a" x)))))
     (setf (splice::patch-set-ramp ps) '(100)
-          (splice::patch-set-sprt-min-n ps) 5
           (splice::patch-set-runtime-contract-interval ps) 0)
     ps))
 
 (defun healthy-probe-set (name)
-  "Two stages, so accepting the first enters the second rather than
-starting a promotion thread."
+  "Two stages, so passing the first enters the second rather than starting
+a promotion thread. A 4x smallest effect keeps the budget near 340."
   (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) x))))
     (setf (splice::patch-set-ramp ps) '(50 100)
+          (splice::patch-set-min-effect ps) 3d0
           (splice::patch-set-runtime-contract-interval ps) 0)
     ps))
 

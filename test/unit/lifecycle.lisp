@@ -73,6 +73,34 @@
       (check seal-it '(:registered :canary-5 :frozen :rolling-back :rolled-back) :refused))))
 
 ;;; ---------------------------------------------------------------------
+;;; Stage limit
+;;; A stage with no control traffic can never score latency, so only the
+;;; limit ends it.
+
+(defun starved-stage-set (limit)
+  "A :CANARY-100 set with an empty control ring and stage limit LIMIT."
+  (let ((ps (bare-set :canary-100 :ramp '(100) :current-fraction 100 :stage-index 0
+                      :stage-limit limit :runtime-contract-interval 0
+                      :control-ring (splice::make-control-ring))))
+    (setf (splice::patch-set-stage ps) (splice::fresh-stage ps 100))
+    ps))
+
+(test a-starved-stage-freezes-at-its-limit
+  (let ((ps (starved-stage-set 3)))
+    (is (eq :continue (splice::report-outcome ps :new nil 1.0)))
+    (is (eq :continue (splice::report-outcome ps :new nil 1.0)))
+    (splice::report-outcome ps :new nil 1.0)
+    (is (eq :frozen (splice:patch-set-state ps)))
+    (is (eq :stage-timeout (first (splice::patch-set-freeze-reason ps))))
+    (is (= 3 (getf (rest (splice::patch-set-freeze-reason ps)) :observations)))))
+
+(test entering-a-stage-resets-its-count
+  (let ((ps (starved-stage-set 10)))
+    (splice::report-outcome ps :new nil 1.0)
+    (splice::with-set-lock (ps) (splice::enter-stage ps 0))
+    (is (= 0 (splice::canary-stage-observations (splice::patch-set-stage ps))))))
+
+;;; ---------------------------------------------------------------------
 ;;; Completion threads
 ;;; Completion threads give way to a freeze that lands during the drain.
 ;;; Nothing is pinned, so the drain ends at once.
@@ -105,6 +133,12 @@
 
 ;;; ---------------------------------------------------------------------
 ;;; Hard triggers and waiting
+
+(test installing-a-set-that-is-not-registered-is-refused
+  (dolist (state '(:installing :staged :canary-5 :vetoed))
+    (let ((ps (bare-set state)))
+      (signals splice:illegal-transition (splice:install ps))
+      (is (eq state (splice:patch-set-state ps))))))
 
 (test taking-a-hard-trigger-leaves-it-unarmed
   (let ((ps (bare-set :canary-5)))

@@ -119,7 +119,7 @@ new code made and leaves the old-code ones alone. Strong keys, as above.")
           (:finalize
            (audit :instance-migration :direction :finalize
                                       :class (class-name (class-of instance))
-                                      :discarded (mapcar (lambda (s) s) discarded-slots))))))))
+                                      :discarded discarded-slots)))))))
 
 (defun migrate-instance-forward (cp instance)
   "Journal the pre-migration state, then run the author's forward migration.
@@ -181,8 +181,8 @@ canary-born, and the author's backward migration synthesizes old values."
                                       :mode :synthesized-reversal
                                       :class (class-patch-class-name cp))
            :synthesized))
-      (migration-failure (e) (error e))
-      (error (e)
+      ;; a migration failure passes through as it is, never wrapped in another
+      ((and error (not migration-failure)) (e)
         (audit :instance-migration :direction :backward :outcome :failed
                                    :class (class-patch-class-name cp) :cause (princ-to-string e))
         (error 'migration-failure :instance instance :direction :backward

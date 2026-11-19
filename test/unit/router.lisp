@@ -112,6 +112,19 @@
     (splice::note-anomaly ps (make-condition 'simple-error :format-control "caught"))
     (is-false (splice::fell-back-p ps))))
 
+(test an-unwinding-anomaly-handler-still-leaves-the-audit-and-the-trigger
+  (with-audit-log (path)
+    (let ((ps (set-in :canary-5 :fraction 5))
+          (splice::*task-id* 1)
+          (splice::*task-anomaly-noted* '())
+          (failure (make-condition 'splice:migration-failure
+                                   :instance :probe :direction :forward :cause "probe")))
+      (is (eq :caught (handler-case (splice::note-anomaly ps failure)
+                        (splice:canary-anomaly () :caught))))
+      (is (eq :migration-failure (first (splice::take-hard-trigger ps))))
+      (is-true (find :canary-anomaly (log-entries path)
+                     :key (lambda (e) (getf e :event)))))))
+
 (test a-fallback-fails-the-new-pin-only
   (let* ((ps (set-in :canary-5 :fraction 5))
          (splice::*task-anomaly-noted* (list (cons ps :fell-back))))
