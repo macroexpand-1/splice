@@ -63,7 +63,7 @@ fails loudly instead of reading NIL"
                step))
 
 (defun finish-walk (walk bounds tail)
-  "WALK with this frame's BOUNDS. Mark trimmed if TAIL says teh audit tail no longer
+  "WALK with this frame's BOUNDS. Mark trimmed if TAIL says the audit tail no longer
    reached back to the cursor"
   (make-walk (getf walk :stage)
              (or (getf walk :trimmed) (eq tail :trimmed))

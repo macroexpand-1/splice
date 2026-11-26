@@ -48,7 +48,7 @@ VALUE holds *only* keywords, strings, integers, and lists"
   (splice:sha256-hex (canonical-text (spec-without-hash spec))))
 
 (defun spec-with-hash (spec)
-  "SPEC wiht :HASH set to its SPEC-HASH as the first field"
+  "SPEC with :HASH set to its SPEC-HASH as the first field"
   (list* :hash (spec-hash spec) (spec-without-hash spec)))
 
 (defun spec-with-error-rates (spec alpha-ppm beta-ppm)
@@ -297,7 +297,7 @@ that split. BETA sizes stage budgets, not this threshold."
                 (broadcast cluster (list :prepare :spec spec)))))
 
 (defun step-receive (cluster id message)
-  "Conductor's response ot MESSAGE from member ID. Fold the message into the
+  "Conductor's response to MESSAGE from member ID. Fold the message into the
 member's view + do whatever the cluster now calls for."
   (let ((view (find-view cluster id)))
     (cond ((not (message-p message))
@@ -505,7 +505,7 @@ the set's last transition"))
 
 (defun make-conductor (&key adapter (alpha 0.01d0) (beta 0.05d0))
   "A conductor with no members. Every message goes through SEND-TO-MEMBER
-on ADAPTER. It goes in teh order it decided them and holds its lock"
+on ADAPTER. It goes in the order it decided them and holds its lock"
   (let ((alpha-ppm (round (* alpha 1000000)))
         (beta-ppm (round (* beta 1000000))))
     (%make-conductor adapter alpha-ppm beta-ppm

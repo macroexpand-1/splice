@@ -88,6 +88,44 @@
           "trail was ~s" (state-trail ps)))))
 
 ;;; ---------------------------------------------------------------------
+;;; A declared set, end to end
+;;; DEFPATCH-SET as a user writes it: declare, install, run tasks, promote.
+
+(defun shipping-cost (weight-kg)
+  (* 4 weight-kg))
+
+(defun declare-flat-rate-shipping ()
+  "Declare and register FLAT-RATE-SHIPPING, and return the set."
+  (splice:defpatch-set flat-rate-shipping
+      (:description "Flat rate for parcels under 2 kg"
+       :ramp '(50 100)
+       :min-effect 3d0)
+    (:function shipping-cost
+     (lambda (weight-kg)
+       (if (< weight-kg 2) 5 (* 4 weight-kg))))
+    (:contract never-negative
+     :check (lambda () (<= 0 (funcall (splice:new 'shipping-cost) 1)))))
+  (splice:find-patch-set 'flat-rate-shipping))
+
+(defun run-shipping-tasks (limit)
+  (loop for id from 1 to limit
+        do (splice:with-task (:id id)
+             (shipping-cost (mod id 5)))))
+
+(test a-declared-set-ramps-and-promotes
+  (let ((ps (declare-flat-rate-shipping)))
+    (unwind-protect
+         (progn
+           (splice:install 'flat-rate-shipping)
+           (run-shipping-tasks 2000)
+           (is (eq :promoted (splice:wait-for-state ps '(:promoted))))
+           (is (search '(:canary-50 :canary-100 :promoting :swapping :promoted)
+                       (state-trail ps))
+               "trail was ~s" (state-trail ps))
+           (is (= 5 (shipping-cost 1))))
+      (retire ps))))
+
+;;; ---------------------------------------------------------------------
 ;;; Sealing
 
 (test a-sealed-set-cannot-be-rolled-back

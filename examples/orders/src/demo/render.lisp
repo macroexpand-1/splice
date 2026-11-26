@@ -242,7 +242,7 @@ PREVIOUS is NIL for a fresh page, which gets every region."
     (if (string= script "") :unchanged script)))
 
 (defun field-reset-p (previous next)
-  "True when teh field must be cleared and drawn whole (fresh page or new order count)"
+  "True when the field must be cleared and drawn whole (fresh page or new order count)"
   (or (null previous)
       (/= (length (getf previous :orders)) (length (getf next :orders)))))
 

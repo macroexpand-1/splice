@@ -6,7 +6,7 @@
 injected faults, the flagship patch set that moves it from float dollars to
 rational minor units, and the session driver that runs it under canary."
   :author "splice project"
-  :license "MIT"
+  :license "BSD-2-Clause"
   :depends-on ("splice")
   :components ((:module "src"
                 :serial t
