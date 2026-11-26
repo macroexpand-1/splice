@@ -81,7 +81,7 @@
     (let ((seen (list '())))
       (splice:with-operator-decisions
           (handler-bind ((splice:operator-decision (choosing #'splice:let-splice-decide seen)))
-            (drive-tasks (lambda () (car seen)))))
+            (drive-outcomes ps (lambda () (car seen)))))
       (is (eq :budget-pass (splice:operator-decision-point (first (car seen)))))
       (is (eq :advance (splice:operator-decision-default (first (car seen)))))
       (is (eq :canary-100 (splice:patch-set-state ps)))

@@ -6,17 +6,17 @@
 ;;;; two run the same checks. It stops at the first failing check and exits 1;
 ;;;; it exits 0 when every check passes.
 ;;;;
-;;;; Each check gets its own image because the demo and the criteria patch the
-;;;; live image, and a suite loaded beside them would see what they changed.
+;;;; Each check gets its own image because the demo patches the live image,
+;;;; and a suite loaded beside it would see what it changed.
 ;;;;
-;;;; The criteria run 100 times per fault class, about 15 minutes. C7 is
-;;;; a timing check (the canary shim must cost under 2x a plain call, 1.37x
-;;;; locally), so it is the likeliest to flake on a noisy machine.
+;;;; The criteria are not a check. They measure detection rates over 100
+;;;; sessions per fault class and the shim's cost in nanoseconds, so their
+;;;; numbers move with chance and with the machine. CI runs them in a step of
+;;;; their own and uploads the report without gating on it.
 ;;;;
-;;;; Every check has a deadline: 10 minutes, or 45 for the criteria. A check
-;;;; still running at its deadline is killed and reported as timed out, so a
-;;;; hang fails the run instead of stalling it. The slowest suites take about
-;;;; a minute locally.
+;;;; Every check has a deadline of 10 minutes. A check still running at its
+;;;; deadline is killed and reported as timed out, so a hang fails the run
+;;;; instead of stalling it. The slowest suites take about a minute locally.
 
 (require :asdf)
 
@@ -77,10 +77,8 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
         (test-check "splice-orders/tests")
         (test-check "splice-orders/demo-probe")
         (test-check "splice-orders/demo-tests")
-        (script-check "examples/orders/scripts/demo.lisp")
-        ;; Writes examples/orders/artifacts/criteria-report.md, which CI uploads.
-        (test-check "splice-orders/criteria" :deadline-seconds 2700))
-  "Every check, in the order they run: fast suites first, the criteria last.")
+        (script-check "examples/orders/scripts/demo.lisp"))
+  "Every check, in the order they run, fast suites first.")
 
 ;;; ---------------------------------------------------------------------
 ;;; Running

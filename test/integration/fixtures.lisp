@@ -19,17 +19,7 @@
 ;;; Each test installs a set over LIFECYCLE-PROBE and retires it
 ;;; afterwards, which puts the original function back.
 
-;;; An identity probe takes one tick of a 24 MHz clock. At that size the
-;;; control p95 is the median tick, and the shim's own overhead on the new
-;;; route crosses it often enough that a healthy set sometimes rejects.
-;;; Summing X a thousand times gives a task microseconds of work, well above
-;;; the shim. Both routes call it, so the control and canary do the same work.
-
-(defun busy-work (x)
-  "X, an integer, computed by summing it a thousand times"
-  (/ (loop repeat 1000 sum x) 1000))
-
-(defun lifecycle-probe (x) (busy-work x))
+(defun lifecycle-probe (x) x)
 
 (defun failing-probe-set (name)
   "Every task canaries and every canary fails, so the one-sample error test
@@ -43,7 +33,7 @@ rejects within a few observations."
 (defun healthy-probe-set (name)
   "Two stages, so passing the first enters the second rather than starting
 a promotion thread. A 4x smallest effect keeps the budget near 360."
-  (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) (busy-work x)))))
+  (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) x))))
     (setf (splice::patch-set-ramp ps) '(50 100)
           (splice::patch-set-min-effect ps) 3d0
           (splice::patch-set-runtime-contract-interval ps) 0)
@@ -87,3 +77,22 @@ retire it whatever happened."
         until (funcall done-p)
         do (splice:with-task (:id id :swallow-errors t)
              (funcall 'lifecycle-probe id))))
+
+;;; ---------------------------------------------------------------------
+;;; Healthy outcomes
+;;; A task's latency is wall-clock time, so a healthy set driven by real
+;;; tasks passes its latency test only most of the time: at a stage below
+;;; 100 the threshold is the control p95, and a canary with the same code
+;;; crosses it at the same rate, plus the shim's cost and the machine's
+;;; noise. A test whose claim needs a pass reports its outcomes itself,
+;;; through REPORT-OUTCOME as WITH-TASK does, at one fixed latency. No canary
+;;; observation then exceeds the threshold, so the stage passes on its budget
+;;; every time. Tests whose sets fail on errors still run real tasks, since an
+;;; error reject does not depend on timing.
+
+(defun drive-outcomes (ps done-p &key (limit 2000))
+  "Report a healthy 1 ms outcome to PS for task ids 1 to LIMIT, each on the
+route its id draws, until DONE-P returns true."
+  (loop for id from 1 to limit
+        until (funcall done-p)
+        do (splice:report-outcome ps (splice::pin-route ps id) nil 1d0)))

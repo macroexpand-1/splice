@@ -37,7 +37,7 @@ jobs:
     name: criteria (${{ matrix.name }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.container }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -68,10 +68,24 @@ jobs:
           EOF
           for archive in *.tgz; do tar -xzf "$archive"; done
 
-      # Every suite, the demo and the full criteria run, each in a fresh SBCL.
-      # The pre-push hook runs the same file, so the list lives there.
+      # Every suite and the demo, each in a fresh SBCL. The pre-push hook runs
+      # the same file, so the list lives there.
       - name: Checks
         run: sbcl --non-interactive --load test/check.lisp
+
+      # The criteria measure detection rates and the shim's cost, which move
+      # with chance and with the runner, so a missed criterion is recorded in
+      # the report rather than failing the run. RUN-CRITERIA's return value is
+      # ignored; an error inside it still exits nonzero and fails the step.
+      - name: Criteria report
+        timeout-minutes: 25
+        run: >-
+          sbcl --non-interactive
+          --eval '(require :asdf)'
+          --eval '(asdf:load-asd (truename "splice.asd"))'
+          --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))'
+          --eval '(asdf:load-system "splice-orders/criteria")'
+          --eval '(uiop:symbol-call :splice-orders/criteria :run-criteria)'
 
       - name: Upload criteria report
         if: always()

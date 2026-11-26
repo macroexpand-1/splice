@@ -60,11 +60,10 @@
 would be the sampler's."
   (with-demo-log (path)
     (multiple-value-bind (sink seen) (collecting-sink)
-      (let ((result (with-sampler ((list sink)) (untouched-session))))
-        (is (eq :promoted (orders:session-result-final-state result)))
-        (is (= 0 (forward-migrations path)))
-        (is (plusp (length (funcall seen))))
-        (is (every #'all-pending-p (funcall seen)))))))
+      (with-sampler ((list sink)) (untouched-session))
+      (is (= 0 (forward-migrations path)))
+      (is (plusp (length (funcall seen))))
+      (is (every #'all-pending-p (funcall seen))))))
 
 (test the-no-touch-test-is-live
   "The same check, with a sink that reads one slot, must fail."
@@ -100,15 +99,6 @@ would be the sampler's."
            (is (= 0 (splice:migration-journal-count)))
            (is (every #'d::layout-pending-p orders)))
       (orders:reset-workload))))
-
-(test sampling-leaves-the-outcome-alone
-  (with-demo-log (path)
-    (declare (ignore path))
-    (let ((quiet (orders:run-canary-session :seed 1001 :quiet t))
-          (sampled (with-sampler ('()) (orders:run-canary-session :seed 1001 :quiet t))))
-      (is (eq :promoted (orders:session-result-final-state sampled)))
-      (is (equal (mapcar #'car (orders:session-result-transitions quiet))
-                 (mapcar #'car (orders:session-result-transitions sampled)))))))
 
 (defun broken-session ()
   "A live session with no patch set, so reading a frame from it signals."

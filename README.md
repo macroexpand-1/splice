@@ -147,14 +147,25 @@ sbcl --non-interactive --eval '(require :asdf)' \
      --eval '(asdf:test-system "splice")'
 ```
 
-Run every check (unit, integration, cluster, the demo, and the criteria) the way CI does:
+Run every check (unit, integration, cluster, and the demo) the way CI does:
 
 ```sh
 sbcl --non-interactive --load test/check.lisp
 ```
 
-That takes about 15 minutes, most of it the criteria runs.
 Each check runs in a fresh SBCL with a deadline, and the run stops at the first failure.
+
+The criteria are a report, not a check.
+They measure detection rates over 100 sessions per fault class and the shim's cost per call, so their numbers move with chance and with the machine.
+CI runs them after the checks and uploads `examples/orders/artifacts/criteria-report.md` without failing on a missed criterion.
+Run them locally, in about 15 minutes, with:
+
+```sh
+sbcl --non-interactive --eval '(require :asdf)' \
+     --eval '(asdf:load-asd (truename "splice.asd"))' \
+     --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))' \
+     --eval '(asdf:test-system "splice-orders/criteria")'
+```
 
 ## The Demo
 
