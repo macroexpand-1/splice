@@ -90,9 +90,17 @@
 ;;; ---------------------------------------------------------------------
 ;;; A declared set, end to end
 ;;; DEFPATCH-SET as a user writes it: declare, install, run tasks, promote.
+;;; The README's version multiplies once, which takes one tick of a 24 MHz
+;;; clock. At that size the control p95 is the median tick, and the shim's
+;;; own overhead on the new route crosses it often enough to reject. Pricing
+;;; per gram gives a task microseconds of work, well above the shim.
+
+(defun price-per-gram (weight-kg rate-per-kg)
+  "WEIGHT-KG times RATE-PER-KG, summed one gram at a time"
+  (/ (loop repeat (* 1000 weight-kg) sum rate-per-kg) 1000))
 
 (defun shipping-cost (weight-kg)
-  (* 4 weight-kg))
+  (price-per-gram weight-kg 4))
 
 (defun declare-flat-rate-shipping ()
   "Declare and register FLAT-RATE-SHIPPING, and return the set."
@@ -102,7 +110,7 @@
        :min-effect 3d0)
     (:function shipping-cost
      (lambda (weight-kg)
-       (if (< weight-kg 2) 5 (* 4 weight-kg))))
+       (if (< weight-kg 2) 5 (price-per-gram weight-kg 4))))
     (:contract never-negative
      :check (lambda () (<= 0 (funcall (splice:new 'shipping-cost) 1)))))
   (splice:find-patch-set 'flat-rate-shipping))
