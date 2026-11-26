@@ -30,15 +30,21 @@ so it reproduces across images and from the audit log."
         :radix 16)
        100))
 
+(defun draw-route (task-id set-name fraction)
+  "Route a canary stage at FRACTION gives TASK-ID: :new when its draw falls
+under FRACTION, :old otherwise. Pure, so the audit log can be checked
+against it offline."
+  (if (< (routing-draw task-id set-name) fraction)
+      :new
+      :old))
+
 (defun pin-route (ps task-id)
   "Route for a fresh task. Canarying sets draw against the ramp fraction,
 a promoting set pins :new, and anything else pins :old."
   (case (patch-set-state ps)
     ((:promoting :swapping) :new)
-    (t (if (and (canary-stage-p (patch-set-state ps))
-                (< (routing-draw task-id (patch-set-name ps))
-                   (patch-set-current-fraction ps)))
-           :new
+    (t (if (canary-stage-p (patch-set-state ps))
+           (draw-route task-id (patch-set-name ps) (patch-set-current-fraction ps))
            :old))))
 
 (defun pin-and-count (ps task-id)

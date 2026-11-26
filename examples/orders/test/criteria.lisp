@@ -48,6 +48,18 @@
   (push (list name ok detail) *report*)
   ok)
 
+(defun join-or-fail (thread seconds)
+  "Join THREAD for up to SECONDS. A thread still running then is a failed
+check naming it, and is left running. Returns :joined or :not-joined"
+  (sb-thread:join-thread thread :default nil :timeout seconds)
+  (if (sb-thread:thread-alive-p thread)
+      (progn
+        (check (format nil "thread ~a exits within ~ds"
+                       (sb-thread:thread-name thread) seconds)
+               nil nil)
+        :not-joined)
+      :joined))
+
 (defun median (numbers)
   (let ((s (sort (remove-if-not #'integerp numbers) #'<)))
     (when s (nth (floor (length s) 2) s))))
@@ -135,7 +147,7 @@ type-check the shim's :NEW into an error."
   (let ((name (format nil "splice-rollback-~a" (splice:patch-set-name ps))))
     (dolist (thread (sb-thread:list-all-threads))
       (when (equal (sb-thread:thread-name thread) name)
-        (sb-thread:join-thread thread :default nil)))))
+        (join-or-fail thread 30)))))
 
 (defun check-runtime-contract-routing ()
   (format t "~%--- runtime contracts call old code through the shims~%")
@@ -251,9 +263,16 @@ migrated forward mid-canary, then restored)"
           do (setf best (max best (parse-integer (subseq (symbol-name state) 7))))
         finally (return best)))
 
+(defun print-session-dot ()
+  "One dot as each session starts, so a long batch shows it is moving"
+  (write-char #\.)
+  (finish-output))
+
 (defun run-batch (kind &key threads)
+  "Run *RUNS* sessions with fault KIND, a dot printed per session"
   (let ((b (make-batch :kind kind :runs *runs*)))
     (dotimes (i *runs*)
+      (print-session-dot)
       (let* ((r (orders:run-canary-session :fault kind
                                            :seed (+ 10000 (* 131 i)
                                                     (if kind (sxhash kind) 0))
@@ -265,11 +284,12 @@ migrated forward mid-canary, then restored)"
           (push (orders:session-result-detection-observations r) (batch-detect-ns b))
           (push (orders:session-result-tasks-run r) (batch-detect-tasks b))
           (push (highest-canary-stage r) (batch-stages b)))))
+    (terpri)
     b))
 
 (defun check-clean-batch ()
   "Spurious rollbacks of a clean patch measure the realized false-positive rate."
-  (format t "clean batch...~%")
+  (format t "clean batch ")
   (let ((b (run-batch nil)))
     (push (cons :clean b) *batches*)
     (let* ((k (batch-caught b))        ; every rollback of a clean patch is spurious
@@ -291,7 +311,7 @@ migrated forward mid-canary, then restored)"
 
 (defun check-fault-batches ()
   (dolist (kind (orders:all-fault-kinds))
-    (format t "~a batch...~%" kind)
+    (format t "~a batch " kind)
     (let ((b (run-batch kind :threads (when (eq kind :load-correlated) 8))))
       (push (cons kind b) *batches*)
       (check (format nil "C2/C6: ~a detection rate ~a/~a >= 0.95 (1-beta)"
@@ -310,21 +330,38 @@ migrated forward mid-canary, then restored)"
 ;;; Promotion swaps only once the :old pins drain, so no task runs a mix of
 ;;; old and new code; the sampled routes are checked offline.
 
+(defun old-routed-task-id (ps)
+  "A task id PS's router pins :old right now. Signals an error when none of
+ten thousand ids does"
+  (loop for id from 1000000 below 1010000
+        when (eq :old (splice::pin-route ps id))
+          return id
+        finally (error "no task id routes ~a to :old in state ~a"
+                       (splice:patch-set-name ps) (splice:patch-set-state ps))))
+
+(defun wait-for-old-pin (ps seconds)
+  "Poll until PS counts an :old pin. Returns :pinned, or :never-pinned once
+SECONDS pass"
+  (loop with deadline = (+ (get-internal-real-time)
+                           (* seconds internal-time-units-per-second))
+        when (plusp (splice::patch-set-pinned-old ps))
+          return :pinned
+        when (> (get-internal-real-time) deadline)
+          return :never-pinned
+        do (sleep 0.01)))
+
 (defun hold-old-task (ps release)
   "Start a thread whose task pins PS :old and waits for the semaphore
-RELEASE. Returns the thread once the pin is counted."
-  (let* ((fraction (splice::patch-set-current-fraction ps))
-         (id (loop for id from 1000000
-                   when (>= (splice::routing-draw id (splice:patch-set-name ps)) fraction)
-                     return id))
+RELEASE. Returns :pinned once the pin is counted or :never-pinned after 10
+seconds, with the thread as a second value. An error in the task is not
+swallowed, so a task that dies says so instead of looking unpinned"
+  (let* ((id (old-routed-task-id ps))
          (thread (sb-thread:make-thread
                   (lambda ()
-                    (splice:with-task (:id id :swallow-errors t)
+                    (splice:with-task (:id id)
                       (sb-thread:wait-on-semaphore release)))
                   :name "criteria-held-task")))
-    (loop until (plusp (splice::patch-set-pinned-old ps))
-          do (sleep 0.01))
-    thread))
+    (values (wait-for-old-pin ps 10) thread)))
 
 (defun every-shim-installed-p (ps)
   (every (lambda (fp)
@@ -340,23 +377,29 @@ RELEASE. Returns the thread once the pin is counted."
     (orders:reset-workload)
     (let ((ps (orders:register-currency-patch-set)))
       (splice:install ps)
-      (let ((held (hold-old-task ps release)))
-        (unwind-protect
-             (progn
-               ;; global, not LET: the promotion thread reads it
-               (setf splice::*drain-timeout-seconds* 1)
-               (splice:promote ps :operator "criteria")
-               (check "C3: a promotion whose :old task never drains freezes instead of swapping"
-                      (and (eq :frozen (splice:wait-for-state ps '(:frozen :promoted) :timeout 10))
-                           (eq :promotion-drain-timeout
-                               (first (splice::patch-set-freeze-reason ps)))
-                           (every-shim-installed-p ps))
-                      (list (splice:patch-set-state ps) (splice::patch-set-freeze-reason ps))))
+      (multiple-value-bind (pin held) (hold-old-task ps release)
+        (unwind-protect (check-drain-timeout-freezes ps pin)
           (setf splice::*drain-timeout-seconds* saved)
           (sb-thread:signal-semaphore release)
-          (sb-thread:join-thread held))))
+          (join-or-fail held 10))))
     (orders:reset-workload)
     (splice:close-audit-log)))
+
+(defun check-drain-timeout-freezes (ps pin)
+  "Promote PS past its held :old task and check it freezes. PIN is what
+HOLD-OLD-TASK returned; with :never-pinned there is nothing to promote past,
+so the check fails without promoting"
+  (when (eq pin :pinned)
+    ;; global, not LET: the promotion thread reads it
+    (setf splice::*drain-timeout-seconds* 1)
+    (splice:promote ps :operator "criteria"))
+  (check "C3: a promotion whose :old task never drains freezes instead of swapping"
+         (and (eq pin :pinned)
+              (eq :frozen (splice:wait-for-state ps '(:frozen :promoted) :timeout 10))
+              (eq :promotion-drain-timeout
+                  (first (splice::patch-set-freeze-reason ps)))
+              (every-shim-installed-p ps))
+         (list pin (splice:patch-set-state ps) (splice::patch-set-freeze-reason ps))))
 
 (defun check-coherence ()
   (format t "~%--- C3: offline coherence check from sampled task records~%")
@@ -372,13 +415,11 @@ RELEASE. Returns the thread once the pin is counted."
                        ;; draining states pin :old, by policy not by draw
                        (when (splice::canary-stage-p state)
                          (incf checked)
-                         (let* ((draw (splice::routing-draw
-                                       (getf entry :task)
-                                       (getf pin :patch-set)))
-                                (expect (if (< draw (getf pin :fraction))
-                                            :new :old)))
-                           (unless (eq expect (getf pin :route))
-                             (incf bad)))))))))
+                         (unless (eq (getf pin :route)
+                                     (splice::draw-route (getf entry :task)
+                                                         (getf pin :patch-set)
+                                                         (getf pin :fraction)))
+                           (incf bad))))))))
     (check (format nil "C3: ~a sampled routes match the deterministic draw (~a bad)"
                    checked bad)
            (and (plusp checked) (zerop bad)) nil)))

@@ -12,6 +12,11 @@
 ;;;; The criteria run 100 times per fault class, about 15 minutes. C7 is
 ;;;; a timing check (the canary shim must cost under 2x a plain call, 1.37x
 ;;;; locally), so it is the likeliest to flake on a noisy machine.
+;;;;
+;;;; Every check has a deadline: 10 minutes, or 45 for the criteria. A check
+;;;; still running at its deadline is killed and reported as timed out, so a
+;;;; hang fails the run instead of stalling it. The slowest suites take about
+;;;; a minute locally.
 
 (require :asdf)
 
@@ -22,7 +27,8 @@
 
 (defstruct check
   (name nil :read-only t)
-  (arguments nil :read-only t))
+  (arguments nil :read-only t)
+  (deadline-seconds nil :read-only t))
 
 (defparameter *root*
   (uiop:pathname-parent-directory-pathname
@@ -46,17 +52,20 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
          "(asdf:load-asd (truename \"examples/orders/splice-orders.asd\"))"
          (format nil "(~a ~s)" operation system-name))))
 
-(defun test-check (system-name)
+(defun test-check (system-name &key (deadline-seconds 600))
   (make-check :name (format nil "test ~a" system-name)
-              :arguments (system-arguments "asdf:test-system" system-name)))
+              :arguments (system-arguments "asdf:test-system" system-name)
+              :deadline-seconds deadline-seconds))
 
 (defun load-check (system-name)
   (make-check :name (format nil "load ~a" system-name)
-              :arguments (system-arguments "asdf:load-system" system-name)))
+              :arguments (system-arguments "asdf:load-system" system-name)
+              :deadline-seconds 600))
 
 (defun script-check (path)
   (make-check :name (format nil "script ~a" path)
-              :arguments (list "--load" path)))
+              :arguments (list "--load" path)
+              :deadline-seconds 600))
 
 (defparameter *checks*
   (list (test-check "splice")
@@ -70,7 +79,7 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
         (test-check "splice-orders/demo-tests")
         (script-check "examples/orders/scripts/demo.lisp")
         ;; Writes examples/orders/artifacts/criteria-report.md, which CI uploads.
-        (test-check "splice-orders/criteria"))
+        (test-check "splice-orders/criteria" :deadline-seconds 2700))
   "Every check, in the order they run: fast suites first, the criteria last.")
 
 ;;; ---------------------------------------------------------------------
@@ -82,21 +91,54 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
          "--non-interactive"
          (check-arguments check)))
 
-(defun check-passes-p (check)
+(defun seconds-since (start)
+  "Whole seconds since START, in internal real time"
+  (floor (- (get-internal-real-time) start) internal-time-units-per-second))
+
+(defun print-heartbeat (check elapsed)
+  "A line saying CHECK is still running after ELAPSED seconds"
+  (multiple-value-bind (minutes seconds) (floor elapsed 60)
+    (format t "~%[~a: ~dm ~2,'0ds elapsed]~%" (check-name check) minutes seconds))
+  (finish-output))
+
+(defun wait-for-exit (process check)
+  "Poll PROCESS, which runs CHECK, until it exits, with a heartbeat line every
+minute. Returns :exited, or :timed-out once CHECK's deadline passes"
+  (loop with start = (get-internal-real-time)
+        for tick from 1
+        for elapsed = (seconds-since start)
+        unless (uiop:process-alive-p process)
+          return :exited
+        when (> elapsed (check-deadline-seconds check))
+          return :timed-out
+        when (zerop (mod tick 60))
+          do (print-heartbeat check elapsed)
+        do (sleep 1)))
+
+(defun run-check (check)
+  "Run CHECK in a fresh SBCL and kill it at its deadline. Returns :passed,
+:failed or :timed-out"
   (format t "~&~%=== ~a ===~%" (check-name check))
   (finish-output)
-  (zerop (nth-value 2 (uiop:run-program (sbcl-command check)
-                                        :directory *root*
-                                        :output :interactive
-                                        :error-output :interactive
-                                        :ignore-error-status t))))
+  (let ((process (uiop:launch-program (sbcl-command check)
+                                      :directory *root*
+                                      :output :interactive
+                                      :error-output :interactive)))
+    (ecase (wait-for-exit process check)
+      (:exited
+       (if (zerop (uiop:wait-process process)) :passed :failed))
+      (:timed-out
+       (uiop:terminate-process process :urgent t)
+       (uiop:wait-process process)
+       :timed-out))))
 
 (defun run-checks (checks)
-  "Run CHECKS in order and stop at the first failure. Returns :passed, or
-:failed with the failing check as a second value."
+  "Run CHECKS in order and stop at the first that does not pass. Returns
+:passed, or :failed or :timed-out with that check as a second value."
   (dolist (check checks :passed)
-    (unless (check-passes-p check)
-      (return (values :failed check)))))
+    (let ((outcome (run-check check)))
+      (unless (eq outcome :passed)
+        (return (values outcome check))))))
 
 (defun report-and-exit (outcome &optional check)
   (ecase outcome
@@ -105,6 +147,10 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
      (uiop:quit 0))
     (:failed
      (format t "~&~%=== FAILED: ~a ===~%" (check-name check))
+     (uiop:quit 1))
+    (:timed-out
+     (format t "~&~%=== TIMED OUT after ~ds: ~a ===~%"
+             (check-deadline-seconds check) (check-name check))
      (uiop:quit 1))))
 
 (multiple-value-call #'report-and-exit (run-checks *checks*))

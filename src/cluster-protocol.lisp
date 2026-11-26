@@ -19,8 +19,10 @@
 ;;;; - contracts run at COMMIT (inside INSTALL), not PREPARE.
 ;;;; - members ramp and promote independently; the conductor gates only
 ;;;;   rollback, never promotion.
-;;;; - no partition handling and no timeouts; a transport reports a dead
-;;;;   link as (:gone).
+;;;; - no partition handling, and the conductor has no timeouts of its own; a
+;;;;   transport reports a dead link as (:gone). A member's watch reports
+;;;;   :STALLED after 2 minutes and gives up after 12 with the pseudo-state
+;;;;   :WATCH-EXPIRED, so the conductor always hears an end.
 
 (in-package #:splice/cluster)
 
@@ -615,16 +617,27 @@ Returns the state it waited for, :TIMEOUT or :NOT-ROLLING-BACK"
         (member-reply cluster-member (list :veto :reason (princ-to-string e)))))))
 
 (defun start-terminal-watch (cluster-member ps)
-  "Thread that tells conductor once PS reaches a terminal state or what state it
-is in after 2 minutes"
+  "Thread that sends conductor :TERMINAL with the state WATCH-FOR-TERMINAL
+returns, so conductor always hears an end from this member"
   (sb-thread:make-thread
    (lambda ()
-     (let ((terminal '(:promoted :rolled-back :frozen)))
-       (when (eq :timeout (splice:wait-for-state ps terminal :timeout 120))
-         (member-reply cluster-member (list :stalled :state (splice:patch-set-state ps)))
-         (loop while (eq :timeout (splice:wait-for-state ps terminal :timeout 60))))
-       (member-reply cluster-member (list :terminal :state (splice:patch-set-state ps)))))
+     (member-reply cluster-member
+                   (list :terminal :state (watch-for-terminal cluster-member ps))))
    :name (format nil "splice-member-watch-~a" (splice:patch-set-name ps))))
+
+(defun watch-for-terminal (cluster-member ps)
+  "Wait for PS to reach a terminal state. After 2 minutes without one it sends
+:STALLED, which makes conductor roll the cluster back, and waits 10 more.
+Returns the terminal state, or :WATCH-EXPIRED when the set never reached one,
+a pseudo-state like the conductor's :DIED"
+  (let* ((terminal '(:promoted :rolled-back :frozen))
+         (first-wait (splice:wait-for-state ps terminal :timeout 120)))
+    (if (eq first-wait :timeout)
+        (progn
+          (member-reply cluster-member (list :stalled :state (splice:patch-set-state ps)))
+          (let ((second-wait (splice:wait-for-state ps terminal :timeout 600)))
+            (if (eq second-wait :timeout) :watch-expired second-wait)))
+        first-wait)))
 
 (defun member-rollback (cluster-member)
   "Roll set back if it is still 'canary-ing', otherwise answer :CONTINUE since3
