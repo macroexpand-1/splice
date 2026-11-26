@@ -55,18 +55,18 @@ restore the pristine workload after"
   (with-clean-workload (path)
     (declare (ignore path))
     (let* ((orders (orders:make-pre-existing-orders (orders:make-rng 42) 40))
-           (before (mapcar #'orders::snapshot-order orders))
            (ps (install-currency-set-at-100)))
       (migrate-orders-forward orders)
       (is (eq :canary-100 (splice:patch-set-state ps)))
       (is (eq :rolled-back (roll-back-and-wait ps)))
-      (let ((comparison (orders::compare-rollback-exactness orders before ps))
+      (let ((comparison (orders::compare-rollback-exactness ps))
             (reversal (first (splice:reverse-migration-report 'orders::currency-migration))))
         (is (getf comparison :fdefinitions-eq) "~s" comparison)
         (is (getf comparison :class-shape-original) "~s" comparison)
-        (is (= 40 (getf comparison :snapshot-restored)) "~s" comparison)
         (is (consp reversal) "~s" reversal)
-        (is (= 40 (getf reversal :journal-exact)) "~s" reversal)))))
+        (is (= 40 (getf reversal :journal-exact)) "~s" reversal)
+        ;; the canary's own writes survive rollback
+        (is (= 0 (getf reversal :slots-undone)) "~s" reversal)))))
 
 (defun workload-signature (seed count)
   "Totals from COUNT seeded orders run against whatever code and class shape

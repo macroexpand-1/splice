@@ -86,11 +86,12 @@
     (is (eql 5 (getf (spec-named 'q slots) :initform)))
     (is (equal '((setf q-of)) (getf (spec-named 'q slots) :writers)))))
 
-(test snapshot-slots-skips-unbound-slots
-  (let ((instance (make-instance 'shape-probe :p 1)))
-    (is (equal '(p 1 q 5)
-               (splice::snapshot-slots instance
-                                       (splice::capture-class-shape 'shape-probe))))))
+(test slot-states-record-unbound-slots
+  (let* ((instance (make-instance 'shape-probe :p 1))
+         (states (splice::slot-states instance
+                                      (splice::capture-class-shape 'shape-probe))))
+    (is (equal '((p :bound 1) (q :bound 5) (r :unbound)) states))
+    (is (equal '(p 1 q 5) (splice::bound-values states)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; A class to migrate
@@ -104,12 +105,8 @@
                                              *migrant-slots*)))
 
 (defmacro with-migration-tables (&body body)
-  "Run BODY against empty migration tables, with MIGRANT in its original shape."
-  `(let ((splice::*migration-registry* (make-hash-table :test #'eq))
-         (splice::*migration-journal* (make-hash-table :test #'eq))
-         (splice::*canary-population* (make-hash-table :test #'eq))
-         (splice::*tracked-classes* (make-hash-table :test #'eq))
-         (splice::*journal-seq* 0))
+  "Run BODY against a fresh migration state, with MIGRANT in its original shape."
+  `(let ((splice::*migration-state* (splice::make-migration-state)))
      (reset-migrant)
      ,@body))
 
@@ -161,11 +158,11 @@ as registration captures it."
   (let ((splice::*task-epochs* (list (list ps route))))
     (apply #'make-instance 'migrant initargs)))
 
-(defun open-backward-window (cp)
-  "Take the first two steps of ROLLBACK-CLASS-PATCH: mark CP's class :backward
-and put its original shape back. A touch now lands where a traffic thread's
-touch would during a rollback."
-  (setf (gethash 'migrant splice::*migration-registry*) (cons cp :backward))
+(defun open-backward-window (ps cp)
+  "Take the first two steps of ROLLBACK-CLASS-PATCH: file PS's entry for CP's
+class as :backward and put its original shape back. A touch now lands where a
+traffic thread's touch would during a rollback."
+  (splice::file-entry (splice::entry-in-phase (splice::entry-of ps cp) :backward))
   (splice::apply-class-shape 'migrant
                              (splice::class-patch-old-slot-specs cp)
                              (splice::class-patch-old-superclass-names cp)))
@@ -187,7 +184,7 @@ touch would during a rollback."
       (splice::begin-class-canary ps cp)
       (is (eql 2000 (slot-value o 'cents)))
       (is (eql 20 (slot-value o 'dollars)))
-      (is (= 1 (splice:migration-journal-count 'migrant))))))
+      (is (= 1 (splice:migration-journal-count 'forward-probe))))))
 
 (test rollback-restores-the-original-shape
   (with-migration-tables
@@ -200,7 +197,7 @@ touch would during a rollback."
       (is (equal '(dollars status note) (direct-slot-names 'migrant)))
       (is (eql 20 (slot-value o 'dollars)))
       (is-false (slot-exists-p o 'cents))
-      (is (= 0 (splice:migration-journal-count 'migrant))))))
+      (is (= 0 (splice:migration-journal-count 'shape-probe-set))))))
 
 (test rollback-reverses-each-kind-of-instance
   (with-migration-tables
@@ -212,7 +209,8 @@ touch would during a rollback."
       (let ((new-born (make-migrant-routed ps :new))
             (old-born (make-migrant-routed ps :old :dollars 7)))
         (setf (slot-value new-born 'cents) 1500)
-        (is (equal '(:journal-exact 1 :synthesized 1 :old-born-unchanged 1)
+        (is (equal '(:journal-exact 1 :synthesized 1 :old-born-unchanged 1
+                     :untouched 0 :failed 0 :slots-undone 0)
                    (splice::rollback-class-patch ps cp)))
         (is (eql 15 (slot-value new-born 'dollars)))
         (is (eql 7 (slot-value old-born 'dollars)))))))
@@ -228,7 +226,7 @@ touch would during a rollback."
       (is (equal '(status note cents) (direct-slot-names 'migrant)))
       (is (eql 2000 (slot-value o 'cents)))
       (is-false (slot-exists-p o 'dollars))
-      (is (= 1 (splice:migration-journal-count 'migrant))))))
+      (is (= 1 (splice:migration-journal-count 'promote-probe))))))
 
 (test sealing-releases-the-journal
   (with-migration-tables
@@ -239,7 +237,7 @@ touch would during a rollback."
       (slot-value o 'cents)
       (splice::promote-class-patch ps cp)
       (is (= 1 (splice::seal-class-journal ps)))
-      (is (= 0 (splice:migration-journal-count 'migrant))))))
+      (is (= 0 (splice:migration-journal-count 'seal-probe))))))
 
 (test a-failed-forward-migration-arms-the-hard-trigger
   (with-migration-tables
@@ -258,14 +256,7 @@ touch would during a rollback."
       (make-migrant-routed ps :new)
       (signals splice::rollback-failure (splice::rollback-class-patch ps cp)))))
 
-;;; ---------------------------------------------------------------------
-;;; Pinned defects
-;;; Each test asserts today's wrong behavior; the guide named in its
-;;; docstring rewrites it.
-
-(test rolling-back-one-set-releases-another-sets-journal
-  "Pins T9: journal records are filed by class, so B's rollback purges A's.
-Guide 02 (02-journal-by-set.md) rewrites it."
+(test rolling-back-one-set-keeps-another-sets-journal
   (with-migration-tables
     (let* ((o (make-instance 'migrant :dollars 20))
            (cp-a (migrant-patch))
@@ -279,21 +270,20 @@ Guide 02 (02-journal-by-set.md) rewrites it."
         (splice::begin-class-canary b cp-b)
         (slot-value o 'memo)
         (splice::rollback-class-patch b cp-b)
-        (is (= 0 (splice:migration-journal-count 'migrant)))))))
+        (is (= 1 (splice:migration-journal-count 'set-a)))
+        (is (= 0 (splice:migration-journal-count 'set-b)))))))
 
-(test an-untouched-instance-is-synthesized-in-the-rollback-window
-  "Pins T10: with no journal record and no birth, backward migration runs on
-an empty property list. Guide 02 rewrites it."
+(test an-untouched-instance-is-left-alone-in-the-rollback-window
   (with-migration-tables
     (let* ((untouched (make-instance 'migrant :dollars 20))
            (cp (migrant-patch))
            (ps (migrant-set 'untouched-probe cp)))
       (splice::begin-class-canary ps cp)
-      (open-backward-window cp)
-      (is (eql 0 (slot-value untouched 'dollars))))))
+      (open-backward-window ps cp)
+      (is (eql 20 (slot-value untouched 'dollars)))
+      (is (= 1 (getf (splice::rollback-class-patch ps cp) :untouched))))))
 
-(test rollback-leaves-bound-a-slot-that-started-unbound
-  "Pins T24: the journal records only bound slots. Guide 02 rewrites it."
+(test rollback-unbinds-a-slot-forward-migration-bound
   (with-migration-tables
     (let* ((o (make-instance 'migrant :dollars 20))
            (cp (migrant-patch :forward #'dollars-to-cents-noting))
@@ -301,11 +291,9 @@ an empty property list. Guide 02 rewrites it."
       (splice::begin-class-canary ps cp)
       (slot-value o 'cents)
       (splice::rollback-class-patch ps cp)
-      (is (slot-boundp o 'note)))))
+      (is-false (slot-boundp o 'note)))))
 
-(test rollback-puts-back-old-code-writes
-  "Pins T5: rollback restores every journaled slot, so an old-routed task's
-later writes are lost. Guide 02 rewrites it, per decision 0018."
+(test rollback-keeps-old-code-writes
   (with-migration-tables
     (let* ((o (make-instance 'migrant :dollars 20 :status :priced))
            (cp (migrant-patch))
@@ -315,28 +303,22 @@ later writes are lost. Guide 02 rewrites it, per decision 0018."
       ;; an old-routed task invoices the order under the union shape
       (setf (slot-value o 'dollars) 18
             (slot-value o 'status) :invoiced)
-      (splice::rollback-class-patch ps cp)
-      (is (eql 20 (slot-value o 'dollars)))
-      (is (eq :priced (slot-value o 'status))))))
+      (is (= 0 (getf (splice::rollback-class-patch ps cp) :slots-undone)))
+      (is (eql 18 (slot-value o 'dollars)))
+      (is (eq :invoiced (slot-value o 'status))))))
 
-(test a-backward-failure-on-a-traffic-thread-passes-rollback
-  "Pins T132: a backward migration that failed once on another thread, then
-succeeded on the rollback's retry, is recorded nowhere. Guide 02 rewrites it."
+(test a-backward-failure-on-a-traffic-thread-fails-the-rollback
   (with-migration-tables
     (let* ((cp (migrant-patch :backward (refuse-first-migration)))
            (ps (migrant-set 'traffic-failure-probe cp)))
       (splice::begin-class-canary ps cp)
       (let ((born (make-migrant-routed ps :new)))
-        (open-backward-window cp)
+        (open-backward-window ps cp)
         ;; a traffic thread touches it first and gets the failure
         (signals splice::migration-failure (slot-value born 'dollars))
-        (is (equal '(:journal-exact 0 :synthesized 1 :old-born-unchanged 0)
-                   (splice::rollback-class-patch ps cp)))
-        (is (eql 0 (slot-value born 'dollars)))))))
+        (signals splice::rollback-failure (splice::rollback-class-patch ps cp))))))
 
-(test a-forward-failure-with-a-stopped-log-escapes-unarmed
-  "Pins T133: the failure clause audits first, and a stopped log signals
-there. Guide 02 rewrites it."
+(test a-forward-failure-with-a-stopped-log-arms-and-signals
   (with-audit-log (path)
     (with-migration-tables
       (let* ((o (make-instance 'migrant :dollars 20))
@@ -344,10 +326,28 @@ there. Guide 02 rewrites it."
              (ps (migrant-set 'stopped-log-probe cp)))
         (splice::begin-class-canary ps cp)
         (stop-audit-log)
-        (let ((escaped (handler-case (progn (slot-value o 'cents) :none)
-                         (error (e) e))))
-          (is-false (typep escaped 'splice::migration-failure))
-          (is (eq :unarmed (splice::patch-set-hard-trigger ps))))))))
+        (signals splice::migration-failure (slot-value o 'cents))
+        (is (eq :migration-failure (first (splice::patch-set-hard-trigger ps))))))))
+
+(test rollback-undoes-a-slot-only-forward-migration-wrote
+  (with-migration-tables
+    (let* ((kept (make-instance 'migrant :dollars 20))
+           (undone (make-instance 'migrant :dollars 30))
+           (cp (migrant-patch :forward #'dollars-to-cents-noting))
+           (ps (migrant-set 'undo-probe cp)))
+      (splice::begin-class-canary ps cp)
+      (slot-value kept 'cents)
+      (slot-value undone 'cents)
+      ;; old code writes one note after forward migration set both
+      (setf (slot-value kept 'note) :later)
+      (is (= 1 (getf (splice::rollback-class-patch ps cp) :slots-undone)))
+      (is (eq :later (slot-value kept 'note)))
+      (is-false (slot-boundp undone 'note)))))
+
+;;; ---------------------------------------------------------------------
+;;; Pinned defects
+;;; Each test asserts today's wrong behavior; the guide named in its
+;;; docstring rewrites it.
 
 (defclass shared-probe ()
   ((tally :allocation :class :initform 0)
@@ -386,8 +386,8 @@ there. Guide 02 rewrites it."
 (test the-class-tables-are-unsynchronized
   "Pins T66: read on hot paths while install threads write them. Guide 03
 rewrites it."
-  (is-false (sb-ext:hash-table-synchronized-p splice::*migration-registry*))
-  (is-false (sb-ext:hash-table-synchronized-p splice::*tracked-classes*))
+  (is-false (sb-ext:hash-table-synchronized-p
+             (splice::migration-state-registry splice::*migration-state*)))
   (is-false (sb-ext:hash-table-synchronized-p splice::*shim-factories*)))
 
 (test promotion-leaves-an-untouched-instance-unmigrated

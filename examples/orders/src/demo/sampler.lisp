@@ -17,19 +17,28 @@
   "True while INSTANCE is waiting for a class update. Reads the layout not slots."
   (not (null (sb-kernel:layout-invalid (sb-kernel:layout-of instance)))))
 
-(defun count-by-route (population)
-  "Canary born counts per creating route. Caller holds *MIGRATION-LOCK*"
-  (loop for birth being the hash-values of population
-        count (eq (cdr birth) :new) into new
-        count (not (eq (cdr birth) :new)) into old
+(defun count-by-route (births)
+  "Canary-born counts per creating route. Caller holds the migration lock"
+  (loop for route being the hash-values of births
+        count (eq route :new) into new
+        count (not (eq route :new)) into old
         finally (return (list :old old :new new))))
 
-(defun read-migration-tables (orders)
-  "Journal membership per order + canary-born counts in one lock"
-  (sb-thread:with-mutex (splice::*migration-lock*)
-    (list :journaled (mapcar (lambda (o) (nth-value 1 (gethash o splice::*migration-journal*)))
+(defun ledger-readings (ledger orders)
+  "Journal membership per order + canary-born counts from LEDGER, in one lock"
+  (splice::with-migration-lock
+    (list :journaled (mapcar (lambda (o)
+                               (nth-value 1 (gethash o (splice::class-ledger-journal ledger))))
                              orders)
-          :canary-born (count-by-route splice::*canary-population*))))
+          :canary-born (count-by-route (splice::class-ledger-births ledger)))))
+
+(defun read-migration-tables (orders)
+  "Journal membership per order + canary-born counts for the flagship set"
+  (let ((ledger (splice::ledger-named 'orders::currency-migration 'orders::order)))
+    (if (eq ledger :none)
+        (list :journaled (mapcar (constantly nil) orders)
+              :canary-born (list :old 0 :new 0))
+        (ledger-readings ledger orders))))
 
 (defun classify-order (pending-p journaled-p)
   "The dot an order gets from its two readings"
@@ -79,8 +88,10 @@ in between shows as one frame of :PENDING never as a wrong :CURRENT."
 
 (defun class-phase (class-name)
   "Migration phase registered for CLASS-NAME or :NONE"
-  (let ((entry (gethash class-name splice::*migration-registry*)))
-    (if entry (cdr entry) :none)))
+  (let ((entry (splice::entry-for-class class-name)))
+    (if (eq entry :untracked)
+        :none
+        (splice::migration-entry-phase entry))))
 
 (defun read-class (class-name)
   (list :name class-name

@@ -6,26 +6,61 @@
 
 (in-package #:splice)
 
-(defvar *migration-registry* (make-hash-table :test #'eq)
-  "class-name -> (class-patch . phase), phase in (:forward :backward :finalize)
-Consulted by the global UPDATE-INSTANCE-FOR-REDEFINED-CLASS method.")
+;;; ---------------------------------------------------------------------
+;;; Migration state
+;;; One bundle holds everything class migration tracks. Tables use strong
+;;; keys: SBCL 2.2.9 weak tables corrupt ("Corrupt NEXT-chain") under GC
+;;; pressure even when mutex-guarded. Ledger tables change only under LOCK.
 
-(defvar *migration-journal* (make-hash-table :test #'eq)
-  "instance -> (:set name :seq n :values pre-migration-slot-plist).
-Strong keys, because SBCL 2.2.9 weak tables corrupt (\"Corrupt NEXT-chain\")
-under GC pressure even when mutex-guarded. Entries are purged at rollback, or
-at SEAL-PATCH after promotion. Guarded by *MIGRATION-LOCK*.")
+(defstruct (journal-record (:copier nil))
+  "An instance's old slots just before and just after the :migrate-forward ran.
+Each is a list of slot states: (name :bound values) or (name :unbound)"
+  (seq 0 :read-only t)
+  (before '() :read-only t)
+  (after '() :read-only t))
 
-(defvar *canary-population* (make-hash-table :test #'eq)
-  "instance -> (class-name . creator-route), for tracked instances created
-during a canary. With no pre-state to restore, reversal synthesizes the ones
-new code made and leaves the old-code ones alone. Strong keys, as above.")
+(defstruct (reversal (:copier nil))
+  "How the instance came back at rollback. KIND is one of the following:
+:journal-exact, :synthesized, :old-born-unchanged, :untouched, or :failed.
+CAUSE is the error"
+  (kind :untouched :read-only t)
+  (slots-undone 0 :read-only t)
+  (cause :none :read-only t))
 
-(defvar *tracked-classes* (make-hash-table :test #'eq)
-  "class-name -> patch-set, while a class patch is in flight.")
+(defstruct (class-ledger (:copier nil))
+  "What a patch set recorded about a class. Keeps a JOURNAL, a BIRTHS record,
+and OUTCOMES of the migration. The tables change in place"
+  (set-name nil :read-only t)
+  (class-name nil :read-only t)
+  (journal (make-hash-table :test #'eq) :read-only t)   ; instance => journal-record
+  (births (make-hash-table :test #'eq) :read-only t)    ; instance => routes that made it
+  (outcomes (make-hash-table :test #'eq) :read-only t)) ; instance => reversal
 
-(defvar *journal-seq* 0)
-(defvar *migration-lock* (sb-thread:make-mutex))
+(defstruct (migration-entry (:copier nil))
+  "A class patch in flight: the set that owns it, the ledger it writes, and
+what touching an obsolete instance does. PHASE is :forward, :backward or
+:finalize; a phase change files a new entry. Every slot is required."
+  (class-patch (error "migration-entry needs :class-patch") :read-only t)
+  (patch-set (error "migration-entry needs :patch-set") :read-only t)
+  (ledger (error "migration-entry needs :ledger") :read-only t)
+  (phase (error "migration-entry needs :phase") :read-only t))
+
+(defstruct (migration-state (:copier nil))
+  "Everything class migration tracks. The ledger outlives the entry until
+a rollback or sealing"
+  (lock (sb-thread:make-mutex :name "splice migration") :read-only t)
+  (registry (make-hash-table :test #'eq) :read-only t)   ; class name => migration entry (in-flight)
+  (ledgers (make-hash-table :test #'equal) :read-only t) ; (set-name . class-name) => class-ledger
+  ;; mutable
+  (journal-seq 0))
+
+(defvar *migration-state* (make-migration-state)
+  "The image's class migration status. The global methods that read it are:
+UPDATE-INSTANCE-FOR-REDEFINED-CLASS and INITIALIZE-INSTANCE")
+
+(defmacro with-migration-lock (&body body)
+  `(sb-thread:with-mutex ((migration-state-lock *migration-state*))
+     ,@body))
 
 ;;; ---------------------------------------------------------------------
 ;;; Capturing and rebuilding class shapes via the MOP
@@ -93,115 +128,320 @@ new code made and leaves the old-code ones alone. Strong keys, as above.")
                      (mapcar #'canonicalize-slot-spec
                              (class-patch-add-slots cp)))))
 
-(defun snapshot-slots (instance slot-specs)
-  "Plist of (slot-name value) for every bound slot in SLOT-SPECS."
-  (loop for spec in slot-specs
-        for name = (getf spec :name)
-        when (slot-boundp instance name)
-          append (list name (slot-value instance name))))
+(defun slot-state (instance name)
+  (if (slot-boundp instance name)
+      (list name :bound (slot-value instance name))
+      (list name :unbound)))
+
+(defun slot-states (instance slot-specs)
+  "State of each slot in SLOT-SPECS (in order)"
+  (mapcar (lambda (spec) (slot-state instance (getf spec :name))) slot-specs))
+
+(defun bound-values (states)
+  "The plist of STATES' bound slots. :migrate-forward receives these"
+  (loop for (name kind value) in states
+        when (eq kind :bound)
+          append (list name value)))
+
+(defun same-slot-state-p (a b)
+  (and (eq (second a) (second b))
+       (eql (third a) (third b))))
+
+(defun restore-slot-state (instance state)
+  (destructuring-bind (name kind &optional value) state
+    (ecase kind
+      (:bound (setf (slot-value instance name) value))
+      (:unbound (slot-makunbound instance name)))))
+
+;;; ---------------------------------------------------------------------
+;;; Ledgers and the registry
+
+(defun ledger-key (set-name class-name)
+  (cons set-name class-name))
+
+(defun ledger-named (set-name class-name)
+  "Ledger for SET-NAME and CLASS-NAME or :NONE"
+  (with-migration-lock
+    (gethash (ledger-key set-name class-name)
+             (migration-state-ledgers *migration-state*) :none)))
+
+(defun ledger-of (ps cp)
+  "PS's ledger for CP's class or :NONE"
+  (ledger-named (patch-set-name ps) (class-patch-class-name cp)))
+
+(defun open-ledger (ps cp)
+  "File a fresh ledger for PS + CP's class. Return it"
+  (let ((ledger (make-class-ledger :set-name (patch-set-name ps)
+                                   :class-name (class-patch-class-name cp))))
+    (with-migration-lock
+      (setf (gethash (ledger-key (patch-set-name ps) (class-patch-class-name cp))
+                     (migration-state-ledgers *migration-state*))
+            ledger))
+    ledger))
+
+(defun close-ledger (ledger)
+  "Drop LEDGER from state and empty its tables (releasing everything)
+Returns how many journal records it held"
+  (with-migration-lock
+    (remhash (ledger-key (class-ledger-set-name ledger)
+                         (class-ledger-class-name ledger))
+             (migration-state-ledgers *migration-state*))
+    (prog1 (hash-table-count (class-ledger-journal ledger))
+      (clrhash (class-ledger-journal ledger))
+      (clrhash (class-ledger-births ledger))
+      (clrhash (class-ledger-outcomes ledger)))))
+
+(defun release-births (ledger)
+  (with-migration-lock
+    (clrhash (class-ledger-births ledger))))
+
+(defun ledger-instances (ledger)
+  "Every instance LEDGER journed or saw born. Unique"
+  (with-migration-lock
+    (let ((journal (class-ledger-journal ledger)))
+      (append (loop for instance being the hash-keys of journal
+                    collect instance)
+              (loop for instance being the hash-keys of (class-ledger-births ledger)
+                    unless (nth-value 1 (gethash instance journal))
+                      collect instance)))))
+
+(defun entry-for-class (class-name)
+  "Migration entry for CLASS-NAME or :UNTRACKED"
+  (gethash class-name (migration-state-registry *migration-state*) :untracked))
+
+(defun entry-of (ps cp)
+  "PS's migration entry for CP's class. Signals when the class has no entry or another set's"
+  (let ((entry (entry-for-class (class-patch-class-name cp))))
+    (unless (and (migration-entry-p entry)
+                 (eq ps (migration-entry-patch-set entry)))
+      (error "~a holds no migration entry for ~a"
+             (patch-set-name ps) (class-patch-class-name cp)))
+    entry))
+
+(defun file-entry (entry)
+  (setf (gethash (class-patch-class-name (migration-entry-class-patch entry))
+                 (migration-state-registry *migration-state*))
+        entry))
+
+(defun entry-in-phase (entry phase)
+  "Copy of ENTRY in PHASE"
+  (make-migration-entry :class-patch (migration-entry-class-patch entry)
+                        :patch-set (migration-entry-patch-set entry)
+                        :ledger (migration-entry-ledger entry)
+                        :phase phase))
+
+(defun retire-entry (entry)
+  (remhash (class-patch-class-name (migration-entry-class-patch entry))
+           (migration-state-registry *migration-state*)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Instance migration
 ;;; One :AFTER method on STANDARD-OBJECT consults the registry, instead of
 ;;; generating a method per class. Untracked classes pay one hash lookup.
 
+;;; Forward
+
+(defun run-migrate-forward (entry instance before)
+  "Run the author's :migrate-forward on INSTANCE. Returns :MIGRATED, or the
+error it signaled."
+  (let ((forward (class-patch-migrate-forward (migration-entry-class-patch entry))))
+    (handler-case (progn (when forward
+                           (funcall forward instance (bound-values before)))
+                         :migrated)
+      (error (e) e))))
+
+(defun journal-forward (entry instance before after)
+  "Record INSTANCE's old-slot states in ENTRY's ledger. Returns the seq."
+  (with-migration-lock
+    (let ((seq (incf (migration-state-journal-seq *migration-state*))))
+      (setf (gethash instance (class-ledger-journal (migration-entry-ledger entry)))
+            (make-journal-record :seq seq :before before :after after))
+      seq)))
+
+(defun entry-audit-fields (entry)
+  (list :patch-set (class-ledger-set-name (migration-entry-ledger entry))
+        :class (class-patch-class-name (migration-entry-class-patch entry))))
+
+(defun audit-forward (entry seq before)
+  (apply #'audit :instance-migration :direction :forward :journal-seq seq
+                                     :pre-state (bound-values before)
+                                     (entry-audit-fields entry)))
+
+(defun audit-beside-failure (event &rest fields)
+  "Audit EVENT for a failure already in hand. Returns the entry's seq,
+:UNLOGGED, or :REFUSED when the log has stopped, so a stopped log never
+replaces the failure being reported."
+  (handler-case (apply #'audit event fields)
+    (error () :refused)))
+
+(defun fail-forward (entry instance condition)
+  "Arm the set's hard trigger, audit the failure, then signal
+MIGRATION-FAILURE. An old-routed task may have fired this, and no shim would
+see it."
+  (let ((ps (migration-entry-patch-set entry)))
+    (arm-hard-trigger ps (list :migration-failure (princ-to-string condition)))
+    (apply #'audit-beside-failure :instance-migration :direction :forward
+                                                      :outcome :failed :cause (princ-to-string condition)
+                                                      (entry-audit-fields entry))
+    (error 'migration-failure :patch-set ps :instance instance
+                              :direction :forward :cause condition)))
+
+(defun migrate-instance-forward (entry instance)
+  "Run the author's forward migration on INSTANCE and journal its old slots
+from just before and just after. A failure arms the set's hard trigger and
+signals MIGRATION-FAILURE. Returns :MIGRATED."
+  (let* ((old-specs (class-patch-old-slot-specs (migration-entry-class-patch entry)))
+         (before (slot-states instance old-specs))
+         (outcome (run-migrate-forward entry instance before)))
+    (unless (eq outcome :migrated)
+      (fail-forward entry instance outcome))
+    (audit-forward entry
+                   (journal-forward entry instance before
+                                    (slot-states instance old-specs))
+                   before)
+    :migrated))
+
+;;; Backward
+
+(defun instance-history (ledger instance)
+  "What LEDGER knows of INSTANCE: :JOURNALED, :NEW-BORN, :OLD-BORN or
+:UNTOUCHED."
+  (with-migration-lock
+    (if (nth-value 1 (gethash instance (class-ledger-journal ledger)))
+        :journaled
+        (ecase (gethash instance (class-ledger-births ledger) :unborn)
+          (:new :new-born)
+          (:old :old-born)
+          (:unborn :untouched)))))
+
+(defun undo-slot (instance before after)
+  "Put one old slot back to BEFORE while it still holds AFTER, the state
+:migrate-forward left. Returns :UNDONE, :UNCHANGED when forward never
+changed it, or :KEPT when something wrote it since."
+  (cond ((same-slot-state-p before after) :unchanged)
+        ((same-slot-state-p (slot-state instance (first after)) after)
+         (restore-slot-state instance before)
+         :undone)
+        (t :kept)))
+
+(defun undo-journaled (ledger instance)
+  "Undo what :migrate-forward wrote to INSTANCE's old slots. Returns the
+reversal."
+  (let ((record (with-migration-lock
+                  (gethash instance (class-ledger-journal ledger)))))
+    (make-reversal :kind :journal-exact
+                   :slots-undone (count :undone
+                                        (mapcar (lambda (before after)
+                                                  (undo-slot instance before after))
+                                                (journal-record-before record)
+                                                (journal-record-after record))))))
+
+(defun synthesize-old-slots (entry instance property-list)
+  "Run the author's :migrate-backward on INSTANCE. Returns the reversal."
+  (let ((backward (class-patch-migrate-backward (migration-entry-class-patch entry))))
+    (when backward
+      (funcall backward instance property-list))
+    (make-reversal :kind :synthesized)))
+
+(defun reverse-instance (entry instance property-list)
+  "Reverse INSTANCE by its history. Returns the reversal; an error in the
+author's code makes it a :FAILED one."
+  (let ((ledger (migration-entry-ledger entry)))
+    (handler-case
+        (ecase (instance-history ledger instance)
+          (:journaled (undo-journaled ledger instance))
+          (:new-born (synthesize-old-slots entry instance property-list))
+          (:old-born (make-reversal :kind :old-born-unchanged))
+          (:untouched (make-reversal :kind :untouched)))
+      (error (e) (make-reversal :kind :failed :cause e)))))
+
+(defun record-reversal (entry instance reversal)
+  "Record INSTANCE's REVERSAL in ENTRY's ledger. A recorded failure stays,
+so a later retry that succeeds cannot hide it. Returns the reversal kept."
+  (with-migration-lock
+    (let ((outcomes (class-ledger-outcomes (migration-entry-ledger entry))))
+      (if (eq :failed (reversal-kind (gethash instance outcomes
+                                              (make-reversal :kind :untouched))))
+          (gethash instance outcomes)
+          (setf (gethash instance outcomes) reversal)))))
+
+(defun journal-seq-of (entry instance)
+  (with-migration-lock
+    (journal-record-seq (gethash instance (class-ledger-journal
+                                           (migration-entry-ledger entry))))))
+
+(defun audit-journal-exact (entry instance reversal)
+  (apply #'audit :instance-migration :direction :backward :mode :journal-exact
+                                     :journal-seq (journal-seq-of entry instance)
+                                     :slots-undone (reversal-slots-undone reversal)
+                                     (entry-audit-fields entry)))
+
+(defun fail-backward (entry instance reversal)
+  "Audit a failed reversal and then signal MIGRATION-FAILURE. The reversal is
+already recorded so the rollback sees it whichever thread touched INSTANCE"
+  (apply #'audit-beside-failure :instance-migration :direction :backward
+                                                    :outcome :failed :cause (princ-to-string (reversal-cause reversal))
+                                                    (entry-audit-fields entry))
+  (error 'migration-failure :patch-set (migration-entry-patch-set entry)
+                            :instance instance :direction :backward
+                            :cause (reversal-cause reversal)))
+
+(defun migrate-instance-backward (entry instance property-list)
+  "Reverse INSTANCE by what ENTRY's ledger knows of it, and record the
+reversal there. Signals MIGRATION-FAILURE when reversing failed. Returns the
+reversal."
+  (let ((reversal (reverse-instance entry instance property-list)))
+    (record-reversal entry instance reversal)
+    (ecase (reversal-kind reversal)
+      (:failed (fail-backward entry instance reversal))
+      (:journal-exact (audit-journal-exact entry instance reversal))
+      ;; no instance identity to log: ROLLBACK-CLASS-PATCH's counts carry them
+      ((:synthesized :old-born-unchanged :untouched)))
+    reversal))
+
+;;; The two methods
+
+(defun migrate-instance (entry instance property-list)
+  "Run ENTRY's phase on INSTANCE, just brought to its class's current shape."
+  (ecase (migration-entry-phase entry)
+    (:forward (migrate-instance-forward entry instance))
+    (:backward (migrate-instance-backward entry instance property-list))
+    ;; nothing per instance: PROMOTE-CLASS-PATCH audits the count
+    (:finalize :finalized)))
+
 (defmethod update-instance-for-redefined-class :after
     ((instance standard-object) added-slots discarded-slots property-list
      &rest initargs)
-  (declare (ignore initargs))
-  (let ((entry (gethash (class-name (class-of instance)) *migration-registry*)))
-    (when entry
-      (destructuring-bind (cp . phase) entry
-        (ecase phase
-          (:forward (migrate-instance-forward cp instance))
-          (:backward (migrate-instance-backward cp instance discarded-slots
-                                                property-list))
-          ;; nothing per instance: PROMOTE-CLASS-PATCH audits the count
-          (:finalize))))))
+  (declare (ignore initargs added-slots discarded-slots))
+  (let ((entry (entry-for-class (class-name (class-of instance)))))
+    (unless (eq entry :untracked)
+      (migrate-instance entry instance property-list))))
 
-(defun migrate-instance-forward (cp instance)
-  "Journal the pre-migration state, then run the author's forward migration.
-Any error is a MIGRATION-FAILURE, a hard rollback trigger."
-  (let ((pre-state (snapshot-slots instance (class-patch-old-slot-specs cp)))
-        (seq nil))
-    (sb-thread:with-mutex (*migration-lock*)
-      (setf seq (incf *journal-seq*)
-            (gethash instance *migration-journal*)
-            (list :set (class-patch-class-name cp) :seq seq :values pre-state)))
-    (handler-case
-        (progn
-          (when (class-patch-migrate-forward cp)
-            (funcall (class-patch-migrate-forward cp) instance pre-state))
-          (audit :instance-migration :direction :forward
-                                     :class (class-patch-class-name cp) :journal-seq seq
-                                     :pre-state pre-state))
-      (error (e)
-        (audit :instance-migration :direction :forward
-                                   :class (class-patch-class-name cp) :journal-seq seq
-                                   :outcome :failed :cause (princ-to-string e))
-        ;; arm the hard trigger directly: an old-routed task may have fired
-        ;; this, and no shim would see it
-        (let ((ps (gethash (class-patch-class-name cp) *tracked-classes*)))
-          (when ps
-            (arm-hard-trigger ps (list :migration-failure (princ-to-string e)))))
-        (error 'migration-failure :instance instance :direction :forward
-                                  :cause e)))))
-
-(defun migrate-instance-backward (cp instance discarded-slots property-list)
-  "Restore from the journal when possible. Otherwise the instance was
-canary-born, and the author's backward migration synthesizes old values."
-  (declare (ignore discarded-slots))
-  (multiple-value-bind (record birth)
-      (sb-thread:with-mutex (*migration-lock*)
-        (values (gethash instance *migration-journal*)
-                (gethash instance *canary-population*)))
-    (handler-case
-        (cond
-          (record
-           (loop for (name value) on (getf record :values) by #'cddr
-                 ;; only restore slots that exist in the reverted shape
-                 when (slot-exists-p instance name)
-                   do (setf (slot-value instance name) value))
-           (audit :instance-migration :direction :backward :mode :journal-exact
-                                      :class (class-patch-class-name cp)
-                                      :journal-seq (getf record :seq))
-           :journal-exact)
-          ;; the next two carry no instance identity, so they are counted in
-          ;; ROLLBACK-CLASS-PATCH's :class-shape entry rather than audited here
-          ((eq (cdr birth) :old)
-           ;; made by old code: dropping the added slots is the whole rollback
-           :old-born)
-          (t
-           (when (class-patch-migrate-backward cp)
-             (funcall (class-patch-migrate-backward cp) instance property-list))
-           :synthesized))
-      ;; a migration failure passes through as it is, never wrapped in another
-      ((and error (not migration-failure)) (e)
-        (audit :instance-migration :direction :backward :outcome :failed
-                                   :class (class-patch-class-name cp) :cause (princ-to-string e))
-        (error 'migration-failure :instance instance :direction :backward
-                                  :cause e)))))
+(defun note-birth (entry instance)
+  "Record INSTANCE, made during ENTRY's canary, with the route that made it."
+  (when (eq :forward (migration-entry-phase entry))
+    (let ((route (task-route-for (migration-entry-patch-set entry))))
+      (with-migration-lock
+        (setf (gethash instance (class-ledger-births (migration-entry-ledger entry)))
+              route)))))
 
 ;;; Track canary-born instances, which never pass through forward migration.
 (defmethod initialize-instance :after ((instance standard-object)
                                        &rest initargs)
   (declare (ignore initargs))
-  (let* ((name (class-name (class-of instance)))
-         (ps (gethash name *tracked-classes*)))
-    (when ps
-      (let ((route (task-route-for ps)))
-        (sb-thread:with-mutex (*migration-lock*)
-          (setf (gethash instance *canary-population*) (cons name route)))))))
+  (let ((entry (entry-for-class (class-name (class-of instance)))))
+    (unless (eq entry :untracked)
+      (note-birth entry instance))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Phase drivers
 ;;; Called by the lifecycle controller.
 
 (defun begin-class-canary (ps cp)
-  "Apply the union shape and start forward migration (lazy, on first touch)."
-  (setf (gethash (class-patch-class-name cp) *migration-registry*)
-        (cons cp :forward)
-        (gethash (class-patch-class-name cp) *tracked-classes*) ps)
+  "Open PS's ledger for CP's class, file a :forward entry, and apply the union
+shape. Forward migration then runs lazily, on first touch."
+  (file-entry (make-migration-entry :class-patch cp :patch-set ps
+                                    :ledger (open-ledger ps cp) :phase :forward))
   (apply-class-shape (class-patch-class-name cp)
                      (class-patch-union-slots cp)
                      (class-patch-old-superclass-names cp))
@@ -217,130 +457,86 @@ canary-born, and the author's backward migration synthesizes old values."
     (when slots
       (slot-boundp instance (sb-mop:slot-definition-name (first slots))))))
 
-(defun eager-migrate-population (class-name)
-  "Migrate now instead of lazily by touching every known instance. Returns
-the count touched."
-  (let ((instances '()))
-    (sb-thread:with-mutex (*migration-lock*)
-      (maphash (lambda (inst birth)
-                 (when (eq (car birth) class-name) (push inst instances)))
-               *canary-population*)
-      (maphash (lambda (inst record)
-                 (when (eq (getf record :set) class-name)
-                   (pushnew inst instances)))
-               *migration-journal*))
-    (dolist (inst instances)
-      (touch-instance inst))
-    (length instances)))
+(defun touch-for-reversal (instance)
+  "Touch INSTANCE so it reverses now. A failure is already in the ledger, so
+it is not raised here. Returns :TOUCHED or :RECORDED."
+  (handler-case (progn (touch-instance instance) :touched)
+    (migration-failure () :recorded)))
 
-(defun instances-to-reverse (class-name)
-  "Every journaled or canary-tracked instance of CLASS-NAME, as
-(instance . kind) where KIND is :journaled, :canary-born, or :old-born.
-An instance in both tables is listed once, as :journaled."
-  (sb-thread:with-mutex (*migration-lock*)
-    (let ((journaled '()) (born '()))
-      (maphash (lambda (inst record)
-                 (when (eq (getf record :set) class-name)
-                   (push (cons inst :journaled) journaled)))
-               *migration-journal*)
-      (maphash (lambda (inst birth)
-                 (when (and (eq (car birth) class-name)
-                            (not (assoc inst journaled :test #'eq)))
-                   (push (cons inst (if (eq (cdr birth) :old)
-                                        :old-born :canary-born))
-                         born)))
-               *canary-population*)
-      (append born journaled))))
+(defun ledger-reversals (ledger)
+  (with-migration-lock
+    (loop for reversal being the hash-values of (class-ledger-outcomes ledger)
+          collect reversal)))
 
-(defun reversal-counts (instances)
-  "How many of INSTANCES were reversed each way."
-  (flet ((count-kind (kind) (count kind instances :key #'cdr)))
-    (list :journal-exact (count-kind :journaled)
-          :synthesized (count-kind :canary-born)
-          :old-born-unchanged (count-kind :old-born))))
+(defun reversal-counts (ledger)
+  "LEDGER's reversals counted by kind, with the slots they undid."
+  (let ((reversals (ledger-reversals ledger)))
+    (flet ((count-kind (kind) (count kind reversals :key #'reversal-kind)))
+      (list :journal-exact (count-kind :journal-exact)
+            :synthesized (count-kind :synthesized)
+            :old-born-unchanged (count-kind :old-born-unchanged)
+            :untouched (count-kind :untouched)
+            :failed (count-kind :failed)
+            :slots-undone (reduce #'+ reversals :key #'reversal-slots-undone)))))
+
+(defun failure-summary (ledger counts)
+  (format nil "~d instance~:p failed to reverse, the first with: ~a"
+          (getf counts :failed)
+          (reversal-cause (find :failed (ledger-reversals ledger)
+                                :key #'reversal-kind))))
 
 (defun rollback-class-patch (ps cp)
-  "Revert the class, then touch every journaled or canary-born instance so
-the counts are deterministic. The first instance that fails to migrate back
-aborts the rollback. Returns the report plist."
-  (let ((class-name (class-patch-class-name cp)))
-    (setf (gethash class-name *migration-registry*) (cons cp :backward))
-    (apply-class-shape class-name
+  "Put CP's class back in its original shape, reverse every instance PS's
+ledger knows, then close the ledger. Signals ROLLBACK-FAILURE when any
+instance failed to reverse, on this thread or another. Returns the counts."
+  (let* ((entry (entry-of ps cp))
+         (ledger (migration-entry-ledger entry)))
+    (file-entry (entry-in-phase entry :backward))
+    (apply-class-shape (class-patch-class-name cp)
                        (class-patch-old-slot-specs cp)
                        (class-patch-old-superclass-names cp))
-    (let ((instances (instances-to-reverse class-name)))
-      ;; each touch lands in MIGRATE-INSTANCE-BACKWARD
-      (dolist (entry instances)
-        (handler-case (touch-instance (car entry))
-          (migration-failure (e)
-            (error 'rollback-failure :patch-set ps :cause e))))
-      (remhash class-name *migration-registry*)
-      (remhash class-name *tracked-classes*)
-      (purge-class-tracking class-name)
-      (let ((report (reversal-counts instances)))
-        (audit :class-shape :class class-name :shape :original
-                            :patch-set (patch-set-name ps)
-                            :reversal-counts report)
-        report))))
+    (mapc #'touch-for-reversal (ledger-instances ledger))
+    (let ((counts (reversal-counts ledger)))
+      (when (plusp (getf counts :failed))
+        (error 'rollback-failure :patch-set ps
+                                 :cause (failure-summary ledger counts)))
+      (retire-entry entry)
+      (close-ledger ledger)
+      (audit :class-shape :class (class-patch-class-name cp) :shape :original
+                          :patch-set (patch-set-name ps) :reversal-counts counts)
+      counts)))
 
 (defun promote-class-patch (ps cp)
-  "Apply the final shape (dropped slots physically removed)."
-  (let ((class-name (class-patch-class-name cp)))
-    (setf (gethash class-name *migration-registry*) (cons cp :finalize))
-    (apply-class-shape class-name
+  "Apply the final shape, finish every instance PS's ledger knows, and release
+its births. The ledger and its journal stay until sealing."
+  (let* ((entry (entry-of ps cp))
+         (ledger (migration-entry-ledger entry))
+         (instances (ledger-instances ledger)))
+    (file-entry (entry-in-phase entry :finalize))
+    (apply-class-shape (class-patch-class-name cp)
                        (class-patch-final-slots cp)
                        (class-patch-old-superclass-names cp))
-    (let ((finalized (eager-migrate-population class-name)))
-      (remhash class-name *migration-registry*)
-      (remhash class-name *tracked-classes*)
-      ;; drop the population; the journal stays until SEAL-PATCH as evidence
-      (purge-class-tracking class-name :journal nil)
-      (audit :class-shape :class class-name :shape :new
-                          :patch-set (patch-set-name ps)
-                          :dropped (class-patch-drop-slots cp)
-                          :finalized finalized))))
-
-(defun purge-class-tracking (class-name &key (journal t) (population t))
-  "Release tracking entries for CLASS-NAME."
-  (sb-thread:with-mutex (*migration-lock*)
-    (flet ((purge (table test)
-             (let ((victims '()))
-               (maphash (lambda (k v) (when (funcall test v) (push k victims)))
-                        table)
-               (dolist (k victims) (remhash k table))
-               (length victims))))
-      (list :journal (if journal
-                         (purge *migration-journal*
-                                (lambda (rec) (eq (getf rec :set) class-name)))
-                         0)
-            :population (if population
-                            (purge *canary-population*
-                                   (lambda (birth) (eq (car birth) class-name)))
-                            0)))))
+    (mapc #'touch-instance instances)
+    (retire-entry entry)
+    (release-births ledger)
+    (audit :class-shape :class (class-patch-class-name cp) :shape :new
+                        :patch-set (patch-set-name ps)
+                        :dropped (class-patch-drop-slots cp)
+                        :finalized (length instances))))
 
 (defun seal-class-journal (ps)
-  "Release journal entries for PS's classes; rollback is no longer offered."
-  (let ((released 0))
-    (sb-thread:with-mutex (*migration-lock*)
-      (dolist (cp (patch-set-class-patches ps))
-        (let ((victims '()))
-          (maphash (lambda (inst record)
-                     (when (eq (getf record :set) (class-patch-class-name cp))
-                       (push inst victims)))
-                   *migration-journal*)
-          (dolist (inst victims)
-            (remhash inst *migration-journal*)
-            (incf released)))))
+  "Close PS's ledgers; rollback is no longer offered. Returns how many journal
+records were released."
+  (let ((released (loop for cp in (patch-set-class-patches ps)
+                        for ledger = (ledger-of ps cp)
+                        unless (eq ledger :none)
+                          sum (close-ledger ledger))))
     (audit :journal-expired :patch-set (patch-set-name ps) :released released)
     released))
 
-(defun migration-journal-count (&optional class-name)
-  (sb-thread:with-mutex (*migration-lock*)
-    (if class-name
-        (let ((n 0))
-          (maphash (lambda (inst record)
-                     (declare (ignore inst))
-                     (when (eq (getf record :set) class-name) (incf n)))
-                   *migration-journal*)
-          n)
-        (hash-table-count *migration-journal*))))
+(defun migration-journal-count (&optional (set-name :all))
+  "Journal records held for SET-NAME, or for every set."
+  (with-migration-lock
+    (loop for ledger being the hash-values of (migration-state-ledgers *migration-state*)
+          when (or (eq set-name :all) (eq set-name (class-ledger-set-name ledger)))
+            sum (hash-table-count (class-ledger-journal ledger)))))

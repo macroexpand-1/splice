@@ -483,7 +483,7 @@ operator cannot move the set out of."
                                          (list :name (fn-patch-name fp)
                                                :installed (fn-patch-new-source-hash fp)))
                                        (patch-set-fn-patches ps))
-                    :journal-retained (migration-journal-count))
+                    :journal-retained (migration-journal-count (patch-set-name ps)))
   :promoted)
 
 ;;; ---------------------------------------------------------------------

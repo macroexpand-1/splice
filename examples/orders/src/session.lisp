@@ -110,11 +110,7 @@ its work. PS must be in the canary stage below 100. Returns the thread"
    '(defmethod print-total ((order order) (stream stream))
      (format stream "$~,2f" (order-float-total order))))
   (splice:unregister-patch-set 'currency-migration)
-  (clrhash splice::*migration-registry*)
-  (clrhash splice::*tracked-classes*)
-  (sb-thread:with-mutex (splice::*migration-lock*)
-    (clrhash splice::*migration-journal*)
-    (clrhash splice::*canary-population*))
+  (setf splice::*migration-state* (splice::make-migration-state))
   (values))
 
 (defun snapshot-order (order)
@@ -320,14 +316,14 @@ when the session began, in internal real time"
                               (live-session-audit-start-seq session))
      :reversal-report (splice:reverse-migration-report 'currency-migration)
      :pre-existing-snapshot pre-snapshot
-     :post-rollback-comparison (rollback-comparison session pre-snapshot)
+     :post-rollback-comparison (rollback-comparison session)
      :wallclock-ms (elapsed-ms start))))
 
-(defun rollback-comparison (session pre-snapshot)
-  "How SESSION's orders compare with PRE-SNAPSHOT after a rollback, or NIL"
+(defun rollback-comparison (session)
+  "How SESSION's patch set compares with the original world after a rollback, or NIL"
   (let ((ps (live-session-patch-set session)))
     (when (eq (splice:patch-set-state ps) :rolled-back)
-      (compare-rollback-exactness (live-session-orders session) pre-snapshot ps))))
+      (compare-rollback-exactness ps))))
 
 (defun elapsed-ms (start)
   "Milliseconds since START, in internal real time"
@@ -373,29 +369,20 @@ after AFTER-SEQ. Returns the count, :NO-LOG or :NO-SPRT-REJECT"
   (sb-thread:with-mutex ((splice::audit-log-lock log))
     (copy-list (splice::audit-log-lines log))))
 
-(defun compare-rollback-exactness (orders pre-snapshot ps)
-  "Check rollback exactness: fdefinitions EQ the originals, the class shape
-is original, and pre-existing orders match their pre-patch snapshot."
-  (let ((fn-ok (every (lambda (fp)
-                        (eq (fdefinition (splice::fn-patch-name fp))
-                            (splice::fn-patch-old-fn fp)))
-                      (splice::patch-set-fn-patches ps)))
-        (shape-ok (null (set-exclusive-or
-                         '(id item-count unit-price discount-code
-                           float-total status)
-                         (mapcar #'sb-mop:slot-definition-name
-                                 (sb-mop:class-direct-slots
-                                  (find-class 'order))))))
-        (restored (loop for o in orders
-                        for snap in pre-snapshot
-                        count (and (equal (order-float-total o)
-                                          (getf snap :float-total))
-                                   (equal (order-status o)
-                                          (getf snap :status))))))
-    (list :fdefinitions-eq fn-ok
-          :class-shape-original shape-ok
-          :snapshot-restored restored
-          :snapshot-total (length orders))))
+(defun compare-rollback-exactness (ps)
+  "Check rollback exactness: fdefinitions EQ the originals and the class shape
+is original. Slot exactness is the core suite's; the reversal report carries
+the rest."
+  (list :fdefinitions-eq (every (lambda (fp)
+                                  (eq (fdefinition (splice::fn-patch-name fp))
+                                      (splice::fn-patch-old-fn fp)))
+                                (splice::patch-set-fn-patches ps))
+        :class-shape-original (null (set-exclusive-or
+                                     '(id item-count unit-price discount-code
+                                       float-total status)
+                                     (mapcar #'sb-mop:slot-definition-name
+                                             (sb-mop:class-direct-slots
+                                              (find-class 'order)))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Baseline workload
