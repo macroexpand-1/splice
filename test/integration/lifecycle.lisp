@@ -20,16 +20,16 @@
 ;;; ---------------------------------------------------------------------
 ;;; Operator handlers re-entering the lifecycle
 
-(test a-verdict-handler-can-freeze-after-an-accept
-  (with-installed-set (ps (healthy-probe-set 'accept-then-freeze))
+(test a-verdict-handler-can-freeze-after-a-pass
+  (with-installed-set (ps (healthy-probe-set 'pass-then-freeze))
     (let* ((seen (list '()))
            (escaped (escaped-error
                      (lambda ()
                        (handler-bind ((splice:canary-verdict (freezing-handler ps seen)))
-                         (drive-tasks (lambda () (car seen))))))))
-      (is (eq :none escaped) "~a escaped the task" escaped)
+                         (drive-outcomes ps (lambda () (car seen))))))))
+      (is (eq :none escaped) "~a escaped the report" escaped)
       (is (= 1 (length (car seen))))
-      (is (eq :accept (splice:canary-verdict-direction (first (car seen)))))
+      (is (eq :pass(splice:canary-verdict-direction (first (car seen)))))
       (is (search '(:canary-50 :canary-100 :frozen) (state-trail ps))
           "trail was ~s" (state-trail ps))
       (is (eq :frozen (splice:patch-set-state ps)))
@@ -88,6 +88,70 @@
           "trail was ~s" (state-trail ps)))))
 
 ;;; ---------------------------------------------------------------------
+;;; A declared set, end to end
+;;; DEFPATCH-SET as a user writes it: declare, install, report outcomes,
+;;; promote. The outcomes go through DRIVE-OUTCOMES, so the ramp passes on
+;;; its budgets rather than on how fast this machine runs a multiply.
+
+(defun shipping-cost (weight-kg)
+  (* 4 weight-kg))
+
+(defun declare-flat-rate-shipping ()
+  "Declare and register FLAT-RATE-SHIPPING, and return the set."
+  (splice:defpatch-set flat-rate-shipping
+      (:description "Flat rate for parcels under 2 kg"
+       :ramp '(50 100)
+       :min-effect 3d0)
+    (:function shipping-cost
+     (lambda (weight-kg)
+       (if (< weight-kg 2) 5 (* 4 weight-kg))))
+    (:contract never-negative
+     :check (lambda () (<= 0 (funcall (splice:new 'shipping-cost) 1)))))
+  (splice:find-patch-set 'flat-rate-shipping))
+
+(test a-declared-set-ramps-and-promotes
+  (let ((ps (declare-flat-rate-shipping)))
+    (unwind-protect
+         (progn
+           (splice:install 'flat-rate-shipping)
+           (drive-outcomes ps (lambda () (not (splice::canary-stage-p
+                                               (splice:patch-set-state ps)))))
+           (is (eq :promoted (splice:wait-for-state ps '(:promoted))))
+           (is (search '(:canary-50 :canary-100 :promoting :swapping :promoted)
+                       (state-trail ps))
+               "trail was ~s" (state-trail ps))
+           (is (= 5 (shipping-cost 1)))
+           ;; the shim is gone: the name points at the new code itself
+           (is (eq (splice::fn-patch-new-fn (first (splice::patch-set-fn-patches ps)))
+                   (fdefinition 'shipping-cost))))
+      (retire ps))))
+
+;;; ---------------------------------------------------------------------
+;;; :SPRT-STEP entries
+
+(defun trail-and-steps (name audit-steps-p)
+  "Drive a healthy set NAME through its canary with :SPRT-STEP entries on
+when AUDIT-STEPS-P. Returns its state trail and how many steps it logged"
+  (with-audit-log (path)
+    (with-installed-set (ps (healthy-probe-set name))
+      (let ((splice::*audit-sprt-steps* audit-steps-p))
+        (drive-outcomes ps (lambda () (not (splice::canary-stage-p
+                                            (splice:patch-set-state ps))))))
+      (splice:wait-for-state ps '(:promoted) :timeout 15)
+      (join-lifecycle-threads ps)
+      (values (state-trail ps)
+              (count :sprt-step (log-entries path)
+                     :key (lambda (entry) (getf entry :event)))))))
+
+(test sprt-step-entries-leave-the-lifecycle-alone
+  (multiple-value-bind (plain plain-steps) (trail-and-steps 'steps-off nil)
+    (multiple-value-bind (stepped steps) (trail-and-steps 'steps-on t)
+      (is (= 0 plain-steps))
+      (is (plusp steps))
+      (is (equal plain stepped) "trails were ~s and ~s" plain stepped)
+      (is (eq :promoted (car (last stepped)))))))
+
+;;; ---------------------------------------------------------------------
 ;;; Sealing
 
 (test a-sealed-set-cannot-be-rolled-back
@@ -110,3 +174,112 @@
     (signals splice:illegal-transition (splice:seal-patch ps :operator "unit-tests"))
     (is-false (splice::patch-set-sealed ps))
     (is (eq :canary-50 (splice:patch-set-state ps)))))
+
+(test unfreezing-a-set-that-is-not-frozen-is-refused
+  (with-installed-set (ps (healthy-probe-set 'unfreeze-unfrozen))
+    (signals splice:illegal-transition (splice:unfreeze ps :resume :operator "unit-tests"))
+    (is (eq :canary-50 (splice:patch-set-state ps)))))
+
+(test an-unknown-unfreeze-decision-leaves-the-set-frozen
+  (with-installed-set (ps (healthy-probe-set 'unfreeze-bad-decision))
+    (splice:freeze ps "operator hold" :operator "unit-tests")
+    (signals splice:illegal-transition (splice:unfreeze ps :sideways :operator "unit-tests"))
+    (is (eq :frozen (splice:patch-set-state ps)))
+    (is-true (splice::patch-set-freeze-reason ps))))
+
+;;; ---------------------------------------------------------------------
+;;; A task that fails before its body runs
+
+(defun run-sampled-task ()
+  "Run one probe task whose id is sampled, so it writes a :task-sample entry"
+  (splice:with-task (:id splice::*task-sample-every*)
+    (funcall 'lifecycle-probe 1)))
+
+(test a-refused-sample-audit-releases-its-pins
+  "A sampled task whose audit write is refused leaves no pin counted and
+reports no observation"
+  (with-temp-log-path (path)
+    (let ((log (splice:open-audit-log path)))
+      (with-installed-set (ps (healthy-probe-set 'refused-sample))
+        ;; a closed checkpoint fails the next write and latches the log
+        (close (splice::audit-log-checkpoint log))
+        (is (typep (escaped-error #'run-sampled-task) 'error))
+        (is (= 0 (splice::patch-set-pinned-new ps)))
+        (is (= 0 (splice::patch-set-pinned-old ps)))
+        (is (= 0 (splice::canary-stage-observations (splice::patch-set-stage ps))))
+        (is (= 0 (splice::control-ring-count (splice::patch-set-control-ring ps))))
+        ;; retiring audits; with the latched log closed, those entries go unlogged
+        (splice:close-audit-log)))))
+
+;;; ---------------------------------------------------------------------
+;;; Sampled tasks
+;;; A :TASK-SAMPLE entry carries enough to re-derive the task's route
+;;; offline. Twenty sampled tasks leave the control arm far short of the 30
+;;; samples the latency test needs, so the stage can only be canarying.
+
+(defun sampled-routes-match-the-draw-p (entry)
+  "True when every canary pin in the :TASK-SAMPLE ENTRY took the route the
+deterministic draw gives its task"
+  (every (lambda (pin)
+           (eq (getf pin :route)
+               (splice::draw-route (getf entry :task) (getf pin :patch-set)
+                                   (getf pin :fraction))))
+         (remove-if-not (lambda (pin) (splice::canary-stage-p (getf pin :state)))
+                        (getf entry :pins))))
+
+(test a-task-sample-records-the-route-the-draw-gives
+  (with-audit-log (path)
+    (with-installed-set (ps (healthy-probe-set 'sampled-routes))
+      (loop for n from 1 to 20
+            do (splice:with-task (:id (* n splice::*task-sample-every*))
+                 (funcall 'lifecycle-probe n)))
+      (is (eq :canary-50 (splice:patch-set-state ps)))
+      (let ((samples (remove :task-sample (log-entries path)
+                             :key (lambda (entry) (getf entry :event))
+                             :test-not #'eq)))
+        (is (= 20 (length samples)))
+        (is (every #'sampled-routes-match-the-draw-p samples))
+        ;; every sample was checked: each logged one pin, in a canary stage
+        (is (equal '(:canary-50)
+                   (remove-duplicates
+                    (loop for entry in samples
+                          append (mapcar (lambda (pin) (getf pin :state))
+                                         (getf entry :pins))))))))))
+
+;;; ---------------------------------------------------------------------
+;;; What a task's latency counts
+
+(defun old-routed-task-id (ps)
+  "First task id that draws :old on PS at every stage below 100"
+  (loop for id from 1
+        when (= 99 (splice::routing-draw id (splice:patch-set-name ps)))
+          return id))
+
+(defun last-control-latency (ps)
+  "The latency of PS's most recent control observation"
+  (let ((ring (splice::patch-set-control-ring ps)))
+    (aref (splice::control-ring-latencies ring)
+          (mod (1- (splice::control-ring-head ring))
+               (splice::control-ring-size ring)))))
+
+(defun hold-set-lock-after (ps signal held seconds)
+  "Start a thread that waits on SIGNAL, takes PS's lock, signals HELD and
+keeps the lock for SECONDS. Returns the thread"
+  (sb-thread:make-thread
+   (lambda ()
+     (sb-thread:wait-on-semaphore signal)
+     (splice::with-set-lock (ps)
+       (sb-thread:signal-semaphore held)
+       (sleep seconds)))))
+
+(test a-task-latency-leaves-out-the-wait-to-release
+  "A task whose pins wait on the set lock reports only its body's time"
+  (with-installed-set (ps (healthy-probe-set 'lock-wait))
+    (let* ((body-done (sb-thread:make-semaphore))
+           (lock-held (sb-thread:make-semaphore))
+           (holder (hold-set-lock-after ps body-done lock-held 0.2)))
+      (splice:with-task (:id (old-routed-task-id ps))
+        (sb-thread:signal-semaphore body-done)
+        (sb-thread:wait-on-semaphore lock-held))
+      (sb-thread:join-thread holder)
+      (is (< (last-control-latency ps) 100)))))

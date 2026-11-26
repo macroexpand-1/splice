@@ -33,8 +33,7 @@ fails loudly instead of reading NIL"
   (list :stage stage
         :trimmed trimmed
         :upper (getf bounds :upper)
-        :lower (getf bounds :lower)
-        :min-n (getf bounds :min-n)
+        :budget (getf bounds :budget)
         :errors errors
         :slow slow))
 
@@ -43,7 +42,7 @@ fails loudly instead of reading NIL"
   (make-walk stage nil '() '() '()))
 
 (defun add-point (points point)
-  "POINTS with POINT, which is a (n . llr) pair. Unchanged when POINT is 0
+  "POINTS with POINT, which is a (n . log-odds) pair. Unchanged when POINT is 0
    (the stream hasn't started or already drawn"
   (if (or (zerop (car point))
           (eql (car point) (car (first (last points)))))
@@ -64,7 +63,7 @@ fails loudly instead of reading NIL"
                step))
 
 (defun finish-walk (walk bounds tail)
-  "WALK with this frame's BOUNDS. Mark trimmed if TAIL says teh audit tail no longer
+  "WALK with this frame's BOUNDS. Mark trimmed if TAIL says the audit tail no longer
    reached back to the cursor"
   (make-walk (getf walk :stage)
              (or (getf walk :trimmed) (eq tail :trimmed))

@@ -6,8 +6,8 @@
 ;;;; Outside WITH-OPERATOR-DECISIONS that does what splice always did.
 ;;;; Inside it the set is flash frozen, so no second verdict can arrive
 ;;;; and no fresh task routes to new code. Once the set lock is released the
-;;;; worker thread enters debugger wiht four restart options. The choice is
-;;;; under the lock and only if teh set is still frozen (for this decision)
+;;;; worker thread enters debugger with four restart options. The choice is
+;;;; under the lock and only if the set is still frozen (for this decision)
 ;;;;
 (in-package #:splice)
 
@@ -119,7 +119,7 @@
   (ecase point
     (:sprt-reject "an SPRT reject")
     (:runtime-contract "a failing runtime contract")
-    (:sprt-accept "an SPRT accept")
+    (:budget-pass "a stage budget pass")
     (:stage-timeout "a stage timeout")
     (:confounded "a confounded control arm")))
 
@@ -146,7 +146,7 @@
   (invoke-decision-restart 'freeze-patch condition))
 
 (defun promote-anyway (&optional condition)
-  "Invoke teh PROMOTE-ANYWAY restart"
+  "Invoke the PROMOTE-ANYWAY restart"
   (invoke-decision-restart 'promote-anyway condition))
 
 (defun let-splice-decide (&optional condition)

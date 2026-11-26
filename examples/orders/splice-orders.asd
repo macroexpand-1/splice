@@ -6,7 +6,7 @@
 injected faults, the flagship patch set that moves it from float dollars to
 rational minor units, and the session driver that runs it under canary."
   :author "splice project"
-  :license "MIT"
+  :license "BSD-2-Clause"
   :depends-on ("splice")
   :components ((:module "src"
                 :serial t
@@ -15,7 +15,7 @@ rational minor units, and the session driver that runs it under canary."
                              (:file "flagship")
                              (:file "session")
                              (:file "cluster-spec"))))
-  :in-order-to ((test-op (test-op "splice-orders/tests" "splice-orders/criteria"))))
+  :in-order-to ((test-op (test-op "splice-orders/tests"))))
 
 (defsystem "splice-orders/cluster"
   :description "The order workload as a TCP cluster member's host"
@@ -35,12 +35,14 @@ artifacts/criteria-report.md with the measured numbers."
                       (error "splice criteria failed; see artifacts/criteria-report.md"))))
 
 (defsystem "splice-orders/tests"
-  :description "The example's tests: the observer hooks the demo uses."
+  :description "The example's tests: the observer hooks the demo uses, and
+what a rollback of the currency set restores."
   :depends-on ("splice-orders" "fiveam")
   :components ((:module "test"
                 :serial t
                 :components ((:file "package")
-                             (:file "hooks"))))
+                             (:file "hooks")
+                             (:file "rollback"))))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (unless (uiop:symbol-call :fiveam :run!

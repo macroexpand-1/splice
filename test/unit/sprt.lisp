@@ -1,4 +1,4 @@
-;;;; sprt.lisp: Wald's SPRT and the control ring.
+;;;; sprt.lisp: the mixture test, the stage budget, and the control ring.
 
 (in-package #:splice-tests)
 
@@ -8,95 +8,119 @@
 (defun close-to (a b &optional (tolerance 1d-9))
   (< (abs (- a b)) tolerance))
 
-(defun observe-until-decided (sprt failure-p limit)
-  "Feed SPRT the same observation until its verdict leaves :CONTINUE or
-LIMIT observations go by. Returns the verdict."
+(defun observe-until-decided (mixture-test route event-p limit)
+  "Feed MIXTURE-TEST the same observation until it rejects or LIMIT
+observations go by. Returns the verdict."
   (loop repeat limit
-        for verdict = (splice:sprt-observe sprt failure-p)
-        unless (eq verdict :continue)
+        for verdict = (splice:mixture-observe mixture-test route event-p)
+        when (eq verdict :reject)
           return verdict
         finally (return :continue)))
 
 ;;; ---------------------------------------------------------------------
-;;; Construction
+;;; The mixture
 
-(test thresholds-follow-wald
-  (let ((s (splice:make-sprt :alpha 0.01d0 :beta 0.05d0)))
-    (is (close-to (log (/ 0.95d0 0.01d0)) (splice:sprt-upper s)))
-    (is (close-to (log (/ 0.05d0 0.99d0)) (splice:sprt-lower s)))
-    (is (> (splice:sprt-upper s) 0 (splice:sprt-lower s)))))
+(test harm-share-follows-the-rate-ratio
+  ;; paper, eq. 12: a 2x rate on a half share takes two thirds of the events
+  (is (close-to (/ 2d0 3) (splice::harm-share 0.5d0 2d0)))
+  (is (close-to 0.05d0 (splice::harm-share 0.05d0 1d0))))
 
-(test p1-is-the-larger-of-factor-and-delta
-  ;; small p0: the additive delta wins
-  (is (close-to 0.021d0 (splice::sprt-p1 (splice:make-sprt :p0 0.001d0))))
-  ;; larger p0: the multiplicative factor wins
-  (is (close-to 0.3d0 (splice::sprt-p1 (splice:make-sprt :p0 0.1d0)))))
+(test one-alternative-is-the-plain-likelihood-ratio
+  (let* ((splice::*harm-steps* 1)
+         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 3d0)))
+    (splice:mixture-observe test :new t)
+    (is (close-to (log (/ 4d0 3)) (splice:mixture-log-odds test)))
+    (splice:mixture-observe test :old t)
+    (is (close-to (log (/ 8d0 9)) (splice:mixture-log-odds test)))))
 
-(test explicit-p1-overrides-the-derived-one
-  (is (close-to 0.05d0 (splice::sprt-p1 (splice:make-sprt :p0 0.001d0 :p1 0.05)))))
+(test the-mixture-averages-the-alternatives
+  ;; ratios 2 and 4 on a half share give shares 2/3 and 4/5
+  (let* ((splice::*harm-steps* 2)
+         (test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 3d0)))
+    (splice:mixture-observe test :new t)
+    (is (close-to (log (/ (+ (/ 4d0 3) (/ 8d0 5)) 2)) (splice:mixture-log-odds test)))))
 
-(test p0-is-clamped-so-logs-stay-finite
-  (is (close-to 1d-4 (splice::sprt-p0 (splice:make-sprt :p0 0))))
-  (is (close-to 0.5d0 (splice::sprt-p0 (splice:make-sprt :p0 0.9d0))))
-  ;; p1 is capped too: 3 x 0.5 would be a probability above 1
-  (is (close-to 0.9d0 (splice::sprt-p1 (splice:make-sprt :p0 0.9d0)))))
+(test two-sample-counts-only-events
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (splice:mixture-observe test :new nil)
+    (splice:mixture-observe test :old nil)
+    (is (= 0 (splice::mixture-test-hits test) (splice::mixture-test-misses test)))
+    (is (close-to 0d0 (splice:mixture-log-odds test)))))
 
-(test set-p0-rederives-p1
-  (let ((s (splice:make-sprt :p0 0.001d0)))
-    (splice::sprt-set-p0 s 0.1d0)
-    (is (close-to 0.1d0 (splice::sprt-p0 s)))
-    (is (close-to 0.3d0 (splice::sprt-p1 s)))))
+(test one-sample-ignores-the-control-arm
+  (let ((test (splice:make-mixture-test :one-sample 0.01d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (splice:mixture-observe test :old t)
+    (is (= 0 (splice::mixture-test-hits test) (splice::mixture-test-misses test)))
+    (splice:mixture-observe test :new nil)
+    (is (= 1 (splice::mixture-test-misses test)))))
 
-;;; ---------------------------------------------------------------------
-;;; Observation
+(test rejects-at-two-over-alpha
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (is (close-to (log 200d0) (splice::mixture-test-log-reject test)))
+    (is (eq :reject (observe-until-decided test :new t 100)))
+    (is (>= (splice:mixture-log-odds test) (log 200d0)))))
 
-(test each-observation-adds-its-log-likelihood-ratio
-  (let* ((s (splice:make-sprt :p0 0.001d0))
-         (p0 (splice::sprt-p0 s))
-         (p1 (splice::sprt-p1 s)))
-    (splice:sprt-observe s t)
-    (is (close-to (log (/ p1 p0)) (splice:sprt-llr s)))
-    (splice:sprt-observe s nil)
-    (is (close-to (+ (log (/ p1 p0)) (log (/ (- 1 p1) (- 1 p0))))
-                  (splice:sprt-llr s)))
-    (is (= 2 (splice:sprt-n s)))))
+(test alpha-is-split-across-every-test-in-a-session
+  ;; two signals per stage, three stages: six tests share the session's alpha
+  (is (close-to (/ 0.01d0 6) (splice::test-alpha 0.01d0 3)))
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0
+                                        :alpha 0.01d0 :stage-count 3 :min-effect 0.3d0)))
+    (is (close-to (log 600d0) (splice::mixture-test-log-reject test)))))
 
-(test no-verdict-before-min-n
-  (let ((s (splice:make-sprt :min-n 50)))
-    ;; two failures already cross the upper bound
-    (dotimes (i 49)
-      (is (eq :continue (splice:sprt-observe s t))))
-    (is (> (splice:sprt-llr s) (splice:sprt-upper s)))
-    (is (eq :reject (splice:sprt-observe s t)))))
+(test a-missing-stage-count-is-refused
+  (signals error (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :min-effect 0.3d0))
+  (signals error (splice:stage-budget 5 :alpha 0.01d0 :beta 0.05d0 :min-effect 0.3d0)))
 
-(test a-healthy-stream-accepts
-  (let ((s (splice:make-sprt :min-n 50 :max-n 2000)))
-    (is (eq :accept (observe-until-decided s nil 2000)))
-    (is (<= (splice:sprt-llr s) (splice:sprt-lower s)))
-    (is (<= 50 (splice:sprt-n s) 2000))))
+(test more-stages-need-bigger-budgets
+  (is (< (splice:stage-budget 25 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0)
+         (splice:stage-budget 25 :alpha 0.01d0 :stage-count 3 :beta 0.05d0 :min-effect 0.3d0))))
 
-(test a-failing-stream-rejects
-  (let ((s (splice:make-sprt :min-n 50)))
-    (is (eq :reject (observe-until-decided s t 2000)))
-    (is (= 50 (splice:sprt-n s)))))
+(test a-better-new-arm-never-rejects
+  ;; events on a 5% arm, but the new arm has a fortieth of them, half its share
+  (let ((test (splice:make-mixture-test :two-sample 0.05d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (is (eq :continue (loop for i from 1 to 2000
+                            for route = (if (zerop (mod i 40)) :new :old)
+                            for verdict = (splice:mixture-observe test route t)
+                            when (eq verdict :reject) return :reject
+                            finally (return :continue))))
+    (is (< (splice:mixture-log-odds test) 0d0))))
 
-(test spent-budget-is-undecided
-  (let ((s (splice:make-sprt :min-n 50 :max-n 200)))
-    (setf (splice:sprt-n s) 200
-          (splice:sprt-llr s) 0d0)
-    (is (eq :undecided (splice:sprt-verdict s)))))
+(test a-null-share-outside-the-unit-interval-is-refused
+  (signals error (splice:make-mixture-test :one-sample 0d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0))
+  (signals error (splice:make-mixture-test :two-sample 1d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
 
-(test a-bound-beats-the-budget
-  (let ((s (splice:make-sprt :min-n 50 :max-n 200)))
-    (setf (splice:sprt-n s) 500
-          (splice:sprt-llr s) (+ (splice:sprt-upper s) 1d0))
-    (is (eq :reject (splice:sprt-verdict s)))))
+(test an-unknown-route-is-refused
+  (let ((test (splice:make-mixture-test :two-sample 0.5d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (signals error (splice:mixture-observe test :sideways t))))
 
 (test snapshot-carries-the-whole-test-state
-  (let ((snap (splice::sprt-snapshot (splice:make-sprt) :error)))
-    (is (eq :error (getf snap :stream)))
-    (dolist (key '(:n :llr :a :b :p0 :p1 :alpha :beta))
-      (is-true (member key snap) "snapshot is missing ~s" key))))
+  (let ((test (splice:make-mixture-test :two-sample 0.25d0 :alpha 0.01d0 :stage-count 1 :min-effect 0.3d0)))
+    (splice:mixture-observe test :new t)
+    (let ((snapshot (splice::mixture-snapshot test :errors)))
+      (is (eq :errors (getf snapshot :signal)))
+      (is (eq :two-sample (getf snapshot :kind)))
+      (is (= 1 (getf snapshot :hits)))
+      (is (= 0 (getf snapshot :misses)))
+      (is (close-to 0.25d0 (getf snapshot :null-share) 1d-6))
+      (is (close-to (log 200d0) (getf snapshot :log-reject) 1d-5)))))
+
+;;; ---------------------------------------------------------------------
+;;; Stage budget
+
+(test budgets-for-the-default-options
+  (flet ((budget (fraction)
+           (splice:stage-budget fraction :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0)))
+    (is (= 9004 (budget 5)))
+    (is (= 11450 (budget 25)))
+    (is (= 17256 (budget 50)))
+    (is (= 9136 (budget 100)))))
+
+(test a-larger-effect-needs-a-smaller-budget
+  (is (< (splice:stage-budget 50 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 3d0)
+         (splice:stage-budget 50 :alpha 0.01d0 :stage-count 1 :beta 0.05d0 :min-effect 0.3d0))))
+
+(test an-unlisted-beta-is-refused
+  (signals error (splice:stage-budget 5 :alpha 0.01d0 :stage-count 1 :beta 0.07d0 :min-effect 0.3d0)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Control ring

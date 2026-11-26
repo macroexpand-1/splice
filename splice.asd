@@ -4,7 +4,7 @@
   :description "The splice library. The coherent patch sets, the SPRT-gated canary rollout,
 the reversible class migration, and the hash-chained log. Very specifically loads no SBCL contribs."
   :author "splice project"
-  :license "MIT"
+  :license "BSD-2-Clause"
   :components ((:module "src"
                 :serial t
                 :components ((:file "package")
@@ -24,7 +24,7 @@ the reversible class migration, and the hash-chained log. Very specifically load
   :description "The cluster protocol as values: patch specs, the conductor and
 the member. No transport, so like splice it loads no SBCL contribs."
   :author "splice project"
-  :license "MIT"
+  :license "BSD-2-Clause"
   :depends-on ("splice")
   :components ((:module "src"
                 :serial t
@@ -35,7 +35,7 @@ the member. No transport, so like splice it loads no SBCL contribs."
 (defsystem "splice/cluster-tcp"
   :description "The cluster's TCP transport: sexps over sockets."
   :author "splice project"
-  :license "MIT"
+  :license "BSD-2-Clause"
   :depends-on ("splice/cluster" "sb-bsd-sockets")
   :serial t
   :components ((:module "src"

@@ -18,7 +18,7 @@
    #:gate #:make-gate #:open-gate #:await-gate #:release-gate
 
    ;; the audit chain strip
-   #:chain-result #:chain-check-js #:reconstruction-text #:tamper-copy
+   #:chain-result #:chain-check-js #:reconstruction-text #:call-with-tampered-copy
 
    ;; recording and replay
    #:make-recorder #:load-recording #:replay-recording

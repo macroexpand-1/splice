@@ -34,33 +34,53 @@
 SYMBOL is not evaluated."
   `(call-with-global ',symbol ,value (lambda () ,@body)))
 
-(defun transition-states (result)
-  (mapcar #'car (orders:session-result-transitions result)))
-
 (defun entries-of (path event)
   (remove-if-not (lambda (entry) (eq (getf entry :event) event))
                  (log-entries path)))
 
-(test hooks-change-no-outcome
-  "A pace that never waits and :SPRT-STEP events leave the lifecycle alone."
-  (with-shared-log (path)
-    (declare (ignore path))
-    (let ((plain (orders:run-canary-session :seed 1001 :quiet t))
-          (hooked (with-global (splice::*audit-sprt-steps* t)
-                    (orders:run-canary-session
-                     :seed 1001 :quiet t
-                     :pace (lambda (stage) (declare (ignore stage)))))))
-      (is (eq :promoted (orders:session-result-final-state plain)))
-      (is (equal (transition-states plain) (transition-states hooked))))))
+;;; A healthy session passes its 5% and 25% stages only most of the time:
+;;; their latency tests compare wall-clock task times. Tests here whose claim
+;;; needs a stage to pass report outcomes themselves, at one fixed latency,
+;;; and tests whose claim needs a promotion have the operator promote.
+
+(defun report-healthy-outcomes (ps pacer first-id)
+  "Pace through PACER and report a healthy 1 ms outcome to PS for each id
+from FIRST-ID until PS leaves its canary stages. Returns :left-canary, or
+:cap-reached after a million ids"
+  (loop for id from first-id below (+ first-id 1000000)
+        unless (splice::canary-stage-p (splice:patch-set-state ps))
+          return :left-canary
+        do (orders::await-pace pacer ps)
+           (splice:report-outcome ps (splice::pin-route ps id) nil 1d0)
+        finally (return :cap-reached)))
+
+(defun call-with-currency-set (fn)
+  "Install a fresh currency set with a 3x smallest effect, so its budgets
+are small, and call FN on it. Restores the pristine workload after"
+  (orders:reset-workload)
+  (unwind-protect
+       (let ((ps (orders:register-currency-patch-set :min-effect 3d0)))
+         (splice:install ps)
+         (funcall fn ps))
+    (orders:reset-workload)))
 
 (test one-pace-per-stage
+  "Three workers pace each stage once between them."
   (with-shared-log (path)
     (declare (ignore path))
-    (let ((paced '()))
-      (orders:run-canary-session
-       :seed 1001 :threads 3 :quiet t
-       :pace (lambda (stage) (push stage paced)))
-      (is (equal '(0 1 2) (reverse paced))))))
+    (call-with-currency-set
+     (lambda (ps)
+       (let* ((paced '())
+              (pacer (orders::make-pacer :pace (lambda (stage) (push stage paced))))
+              (workers (loop for w from 0 below 3
+                             collect (let ((first-id (* 1000000 (1+ w))))
+                                       (sb-thread:make-thread
+                                        (lambda () (report-healthy-outcomes ps pacer first-id))
+                                        :name "pace-worker")))))
+         (is (every (lambda (outcome) (eq :left-canary outcome))
+                    (mapcar #'sb-thread:join-thread workers)))
+         (is (eq :promoted (splice:wait-for-state ps '(:promoted) :timeout 30)))
+         (is (equal '(0 1 2) (reverse paced))))))))
 
 (test the-session-stays-published-after-it-ends
   (with-shared-log (path)
@@ -78,13 +98,27 @@ SYMBOL is not evaluated."
               (splice:patch-set-state (orders:live-session-patch-set
                                        orders:*live-session*)))))))
 
+(defun await-old-pin (ps seconds)
+  "Poll until PS counts an :old pin. Returns :pinned, or :never-pinned once
+SECONDS pass"
+  (loop with deadline = (+ (get-internal-real-time)
+                           (* seconds internal-time-units-per-second))
+        when (plusp (splice::patch-set-pinned-old ps))
+          return :pinned
+        when (> (get-internal-real-time) deadline)
+          return :never-pinned
+        do (sleep 0.01)))
+
 (defun held-task-pace (gate)
-  "A pace that starts the held task at stage 1 and never waits itself."
+  "A pace that, before the first stage runs a task, starts the held task,
+waits for its :old pin and promotes. The promotion then waits on the held
+task, whatever the stage tests would have said."
   (lambda (stage)
-    (when (= stage 1)
-      (orders:start-held-task
-       (orders:live-session-patch-set orders:*live-session*)
-       (lambda () (sb-thread:wait-on-semaphore gate))))))
+    (when (= stage 0)
+      (let ((ps (orders:live-session-patch-set orders:*live-session*)))
+        (orders:start-held-task ps (lambda () (sb-thread:wait-on-semaphore gate)))
+        (when (eq :pinned (await-old-pin ps 10))
+          (splice:promote ps :operator "hooks-tests"))))))
 
 (defun await-live-session (timeout)
   "The published live session, waiting up to TIMEOUT seconds, or :NONE."
@@ -123,9 +157,13 @@ SYMBOL is not evaluated."
              (verdict (second (getf decision :trigger)))
              (step (first (last (remove-if-not
                                  (lambda (e) (< (getf e :seq) (getf decision :seq)))
-                                 (entries-of path :sprt-step))))))
-        (is (eql (getf verdict :n) (car (getf step :errors))))
-        (is (< (abs (- (getf verdict :llr) (cdr (getf step :errors)))) 1e-3))))))
+                                 (entries-of path :sprt-step)))))
+             ;; the step names the latency signal :slow
+             (point (getf step (ecase (getf verdict :signal)
+                                 (:errors :errors)
+                                 (:latency :slow)))))
+        (is (eql (getf verdict :n) (car point)))
+        (is (< (abs (- (getf verdict :log-odds) (cdr point))) 1e-3))))))
 
 (test a-drain-timeout-freezes-promotion
   (with-shared-log (path)
@@ -133,8 +171,18 @@ SYMBOL is not evaluated."
     (with-global (splice::*drain-timeout-seconds* 1)
       (let ((gate (sb-thread:make-semaphore)))
         (unwind-protect
-             (is (eq :frozen (orders:session-result-final-state
-                              (orders:run-canary-session
-                               :seed 1001 :threads 3 :quiet t
-                               :pace (held-task-pace gate)))))
+             (progn
+               (is (eq :frozen (orders:session-result-final-state
+                                (orders:run-canary-session
+                                 :seed 1001 :threads 3 :quiet t
+                                 :pace (held-task-pace gate)))))
+               ;; frozen instead of swapping: every name still points at its shim
+               (is (every-shim-installed-p
+                    (orders:live-session-patch-set orders:*live-session*))))
           (sb-thread:signal-semaphore gate))))))
+
+(defun every-shim-installed-p (ps)
+  (every (lambda (fn-patch)
+           (eq (fdefinition (splice::fn-patch-name fn-patch))
+               (splice::fn-patch-shim fn-patch)))
+         (splice::patch-set-fn-patches ps)))

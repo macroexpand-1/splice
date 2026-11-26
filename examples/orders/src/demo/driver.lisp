@@ -116,11 +116,12 @@ join and may still write"
              :reset)))
 
 (defun start-act (act sinks)
-  "Start ACT with SINKS. Returns recording's path, :session-running (if the previous act is alive)
-or :player-stuck / :sampler-stuck"
-  (if (session-alive-p)
-      :session-running
-      (begin-act act sinks)))
+  "Start ACT with SINKS. Returns recording's path, :session-running (if the previous act is alive),
+:no-audit-log or :sprt-steps-off (if pre-flight wasn't done), or :player-stuck / :sampler-stuck"
+  (cond ((session-alive-p) :session-running)
+        ((not (and *demo-log-path* splice:*audit-log*)) :no-audit-log)
+        ((not splice::*audit-sprt-steps*) :sprt-steps-off)
+        (t (begin-act act sinks))))
 
 (defun begin-act (act sinks)
   "stop the player and the last recording. Open ACT only once both old
@@ -133,7 +134,8 @@ sources hav ejoined"
   (reset-between-acts)
   (let ((path (start-recording act)))
     (setf *current-act* act
-          *act-outcome* :running)
+          *act-outcome* :running
+          orders:*live-session* nil)
     (start-sampler (act-sinks sinks))
     (setf *session-thread*
           (sb-thread:make-thread (lambda () (run-act act)) :name "demo-session"))

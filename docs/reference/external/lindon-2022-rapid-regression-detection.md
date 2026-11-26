@@ -11,7 +11,7 @@ A pinned citation, not a copy of the paper.
 
 It presents sequential tests for canary deployments that can be monitored continuously while strictly controlling the probability of a false detection.
 The tests are of stochastic order and of equality in distribution, and the paper demonstrates them on two case studies at Netflix.
-Splice's canary verdicts are designed against it.
+It is the canary-testing context for splice's verdicts; splice's own test is the two-arm mixture test the paper cites as its reference 15 (Lindon and Malek, pinned beside this file).
 
 ## Why the Paper Is Not Vendored
 

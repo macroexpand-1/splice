@@ -116,10 +116,8 @@ new code made and leaves the old-code ones alone. Strong keys, as above.")
           (:forward (migrate-instance-forward cp instance))
           (:backward (migrate-instance-backward cp instance discarded-slots
                                                 property-list))
-          (:finalize
-           (audit :instance-migration :direction :finalize
-                                      :class (class-name (class-of instance))
-                                      :discarded (mapcar (lambda (s) s) discarded-slots))))))))
+          ;; nothing per instance: PROMOTE-CLASS-PATCH audits the count
+          (:finalize))))))
 
 (defun migrate-instance-forward (cp instance)
   "Journal the pre-migration state, then run the author's forward migration.
@@ -168,21 +166,17 @@ canary-born, and the author's backward migration synthesizes old values."
                                       :class (class-patch-class-name cp)
                                       :journal-seq (getf record :seq))
            :journal-exact)
+          ;; the next two carry no instance identity, so they are counted in
+          ;; ROLLBACK-CLASS-PATCH's :class-shape entry rather than audited here
           ((eq (cdr birth) :old)
            ;; made by old code: dropping the added slots is the whole rollback
-           (audit :instance-migration :direction :backward
-                                      :mode :old-born-unchanged
-                                      :class (class-patch-class-name cp))
            :old-born)
           (t
            (when (class-patch-migrate-backward cp)
              (funcall (class-patch-migrate-backward cp) instance property-list))
-           (audit :instance-migration :direction :backward
-                                      :mode :synthesized-reversal
-                                      :class (class-patch-class-name cp))
            :synthesized))
-      (migration-failure (e) (error e))
-      (error (e)
+      ;; a migration failure passes through as it is, never wrapped in another
+      ((and error (not migration-failure)) (e)
         (audit :instance-migration :direction :backward :outcome :failed
                                    :class (class-patch-class-name cp) :cause (princ-to-string e))
         (error 'migration-failure :instance instance :direction :backward
@@ -296,14 +290,15 @@ aborts the rollback. Returns the report plist."
     (apply-class-shape class-name
                        (class-patch-final-slots cp)
                        (class-patch-old-superclass-names cp))
-    (eager-migrate-population class-name)
-    (remhash class-name *migration-registry*)
-    (remhash class-name *tracked-classes*)
-    ;; drop the population; the journal stays until SEAL-PATCH as evidence
-    (purge-class-tracking class-name :journal nil)
-    (audit :class-shape :class class-name :shape :new
-                        :patch-set (patch-set-name ps)
-                        :dropped (class-patch-drop-slots cp))))
+    (let ((finalized (eager-migrate-population class-name)))
+      (remhash class-name *migration-registry*)
+      (remhash class-name *tracked-classes*)
+      ;; drop the population; the journal stays until SEAL-PATCH as evidence
+      (purge-class-tracking class-name :journal nil)
+      (audit :class-shape :class class-name :shape :new
+                          :patch-set (patch-set-name ps)
+                          :dropped (class-patch-drop-slots cp)
+                          :finalized finalized))))
 
 (defun purge-class-tracking (class-name &key (journal t) (population t))
   "Release tracking entries for CLASS-NAME."

@@ -242,7 +242,7 @@ PREVIOUS is NIL for a fresh page, which gets every region."
     (if (string= script "") :unchanged script)))
 
 (defun field-reset-p (previous next)
-  "True when teh field must be cleared and drawn whole (fresh page or new order count)"
+  "True when the field must be cleared and drawn whole (fresh page or new order count)"
   (or (null previous)
       (/= (length (getf previous :orders)) (length (getf next :orders)))))
 
@@ -314,31 +314,32 @@ Walks without bounds yet is a label alone"
   (let ((x (x-scale points sprt))
         (y (y-scale sprt top)))
     (list (bound-line y (getf sprt :upper) "reject: roll back" :reject)
-          (bound-line y (getf sprt :lower) "accept: advance" :accept)
-          (min-n-line x (getf sprt :min-n) top)
+          (budget-line x (getf sprt :budget) top)
           (walk-line x y points)
           (top-arrow x points sprt top))))
 
 (defun x-scale (points sprt)
-  "Pixel x for an observation count N: 0 to the larger of twice min-n and the newest n."
-  (let ((x-max (max 1 (* 2 (getf sprt :min-n)) (or (car (first (last points))) 0))))
+  "Pixel x for an observation count N: 0 to the larger of the budget and the newest n."
+  (let ((x-max (max 1 (getf sprt :budget) (or (car (first (last points))) 0))))
     (lambda (n) (round (+ 60 (* 560 (/ n x-max)))))))
 
 (defun y-scale (sprt top)
-  "Pixel y for an LLR, clamped to one beyond each bound."
-  (let ((hi (+ (getf sprt :upper) 1))
-        (lo (- (getf sprt :lower) 1)))
-    (lambda (llr) (round (+ top 40 (* 180 (/ (- hi (max lo (min hi llr))) (- hi lo))))))))
+  "Pixel y for log odds, clamped to one beyond the reject line either side of 0."
+  (let* ((hi (+ (getf sprt :upper) 1))
+         (lo (- hi)))
+    (lambda (log-odds)
+      (round (+ top 40 (* 180 (/ (- hi (max lo (min hi log-odds))) (- hi lo))))))))
 
 (defun bound-line (y value label key)
   (format nil "~a~a"
           (svg-line 60 (funcall y value) 620 (funcall y value) 3 key)
           (svg-text 400 (- (funcall y value) 8) label key)))
 
-(defun min-n-line (x min-n top)
-  (format nil "<line x1='~d' y1='~d' x2='~d' y2='~d' stroke='~a' stroke-width='3' stroke-dasharray='8 6' data-role='min-n'/>~a"
-          (funcall x min-n) (+ top 40) (funcall x min-n) (+ top 220) (color :muted)
-          (svg-text (+ 8 (funcall x min-n)) (+ top 236) "earliest verdict" :muted)))
+(defun budget-line (x budget top)
+  "A dashed vertical line where the stage passes, at BUDGET scored observations."
+  (format nil "<line x1='~d' y1='~d' x2='~d' y2='~d' stroke='~a' stroke-width='3' stroke-dasharray='8 6' data-role='budget'/>~a"
+          (funcall x budget) (+ top 40) (funcall x budget) (+ top 220) (color :accept)
+          (svg-text (- (funcall x budget) 150) (+ top 236) "budget: pass" :accept)))
 
 (defun walk-line (x y points)
   (format nil "<polyline fill='none' stroke='~a' stroke-width='4' data-role='walk' points='~{~a~^ ~}'/>"

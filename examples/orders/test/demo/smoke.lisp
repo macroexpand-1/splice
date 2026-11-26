@@ -31,6 +31,17 @@
                           do (write-line line out))))
         (close stream)))))
 
+(test a-render-error-fails-only-its-page
+  "Write-frame renders inside deliver, so a render error counts against one page."
+  (let ((splice-orders/demo-clog::*connections* (list (cons :page-1 nil) (cons :page-2 nil))))
+    (is (eql 0 (splice-orders/demo-clog:write-frame :not-a-snapshot)))))
+
+(test a-page-that-signals-is-forgotten
+  "The registry drops a page even when clog:run exits by signaling."
+  (let ((splice-orders/demo-clog::*connections* '()))
+    (signals error (splice-orders/demo-clog::run-registered :not-a-body))
+    (is (null splice-orders/demo-clog::*connections*))))
+
 (test view-serves-page
   (splice-orders/demo-clog:start-view :port 8418)
   (unwind-protect

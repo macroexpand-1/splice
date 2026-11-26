@@ -67,8 +67,7 @@ OTHER-KEYS is :ALLOWED)."
 
 (defmacro defpatch-set (name (&key description ticket (ramp ''(5 25 100))
                                 paired-fallback (alpha 0.01d0) (beta 0.05d0)
-                                (sprt-min-n 50) (sprt-max-n 2000)
-                                (stage-limit 40000))
+                                (min-effect 0.3d0) (stage-limit 40000))
                         &body clauses)
   "Declare a coherent patch set. Clauses:
   (:function name lambda-form)
@@ -81,8 +80,7 @@ OTHER-KEYS is :ALLOWED)."
     (make-patch-set :name ',name :description ,description :ticket ,ticket
                     :ramp ,ramp :paired-fallback ,paired-fallback
                     :alpha ,alpha :beta ,beta
-                    :sprt-min-n ,sprt-min-n :sprt-max-n ,sprt-max-n
-                    :stage-limit ,stage-limit
+                    :min-effect ,min-effect :stage-limit ,stage-limit
                     :fn-patches (list ,@(clause-forms :function clauses))
                     :method-patches (list ,@(clause-forms :method clauses))
                     :class-patches (list ,@(clause-forms :class clauses))
@@ -245,8 +243,25 @@ call OLD accepts, or :COVERS"
                    nil)
       :no-method))
 
+(defun method-patch-missing (mp)
+  "One line naming what MP's generic function or specializers lack, or :PRESENT"
+  (let ((gf-name (method-patch-gf-name mp))
+        (missing-classes (remove-if (lambda (name) (find-class name nil))
+                                    (method-patch-specializer-names mp))))
+    (cond ((not (fboundp gf-name))
+           (format nil "no generic function ~a" gf-name))
+          ((not (typep (fdefinition gf-name) 'generic-function))
+           (format nil "~a is not a generic function" gf-name))
+          (missing-classes
+           (format nil "no class ~{~a~^, ~}" missing-classes))
+          (t :present))))
+
 (defun capture-old-method (ps mp)
-  "Check MP's method exists, then record it for rollback."
+  "Check MP's generic function, classes and method exist, then record the
+method for rollback."
+  (let ((missing (method-patch-missing mp)))
+    (unless (eq missing :present)
+      (veto ps :static-missing missing)))
   (let ((method (find-old-method mp)))
     (when (eq method :no-method)
       (veto ps :static-missing
@@ -271,7 +286,41 @@ call OLD accepts, or :COVERS"
   (dolist (mp (patch-set-method-patches ps)) (capture-old-method ps mp))
   (dolist (cp (patch-set-class-patches ps)) (capture-old-class ps cp)))
 
+(defun check-options (ps)
+  "Veto PS when one of its canary options can't size or run a stage"
+  (let ((problem (option-problem ps)))
+    (unless (eq problem :valid)
+      (veto ps :invalid-option problem))))
+
+(defun option-problem (ps)
+  "One line naming PS's first bad canary option, or :VALID"
+  (let ((ramp (patch-set-ramp ps))
+        (alpha (patch-set-alpha ps))
+        (beta (patch-set-beta ps))
+        (min-effect (patch-set-min-effect ps))
+        (stage-limit (patch-set-stage-limit ps)))
+    (cond ((not (rising-percentages-p ramp))
+           (format nil "ramp ~s is not a rising list of percentages above 0 and up to 100"
+                   ramp))
+          ((not (and (realp alpha) (< 0 alpha 1)))
+           (format nil "alpha ~s is not between 0 and 1" alpha))
+          ((not (and (realp beta) (assoc beta *power-z-scores* :test #'=)))
+           (format nil "beta ~s is not one of ~{~a~^, ~}" beta (mapcar #'car *power-z-scores*)))
+          ((not (and (realp min-effect) (plusp min-effect)))
+           (format nil "min-effect ~s is not a positive number" min-effect))
+          ((not (and (integerp stage-limit) (plusp stage-limit)))
+           (format nil "stage-limit ~s is not a positive integer" stage-limit))
+          (t :valid))))
+
+(defun rising-percentages-p (ramp)
+  "True when RAMP is a non-empty list of numbers above 0 and up to 100, each
+above the one before"
+  (and (consp ramp)
+       (every (lambda (percent) (and (realp percent) (< 0 percent) (<= percent 100))) ramp)
+       (apply #'< ramp)))
+
 (defun run-static-checks (ps)
+  (check-options ps)
   (check-overlap ps)
   (dolist (fp (patch-set-fn-patches ps))
     (check-arity-compatibility ps fp)
@@ -307,9 +356,23 @@ call OLD accepts, or :COVERS"
          :class-details (mapcar #'class-patch-audit-fields
                                 (patch-set-class-patches ps))))
 
+(defun check-name-free (ps)
+  "Veto PS when the registry holds a different set of its name that is past
+:REGISTERED and not finished, since replacing it would orphan its shims"
+  (let ((existing (gethash (patch-set-name ps) *patch-sets*)))
+    (when (and existing
+               (not (eq existing ps))
+               (not (eq :registered (patch-set-state existing)))
+               (not (finished-p existing)))
+      (veto ps :static-name-in-use
+            (format nil "~a is ~a; roll it back or let it finish first"
+                    (patch-set-name ps) (patch-set-state existing))))))
+
 (defun register-patch-set (ps)
   "Store PS, capture what it replaces, run the static checks and audit it.
-Any failed check vetoes PS."
+Any failed check vetoes PS. A same-named set that is still in flight is never
+replaced: PS is vetoed instead, before it is stored."
+  (check-name-free ps)
   (setf (gethash (patch-set-name ps) *patch-sets*) ps)
   (capture-old-world ps)
   (run-static-checks ps)
@@ -335,21 +398,29 @@ printed error when the check signaled one."
                           :contract (contract-name contract) :phase phase
                           :verdict verdict :detail detail))
 
-(defun run-contracts (ps &key (phase :pre-flight))
-  "Run every contract. Returns :PASS, or at runtime (values :FAIL name) for
-the first failing contract. A failure at pre-flight signals PATCH-VETOED.
-Contracts run outside any task, so a plain call reaches old code."
+(defun run-pre-flight-contracts (ps)
+  "Run every contract before install. Returns :PASS; the first failing
+contract vetoes PS, signaling PATCH-VETOED. Contracts run outside any task,
+so a plain call reaches old code."
   (let ((*contract-context* ps)
         (*task-epochs* nil))
     (dolist (contract (patch-set-contracts ps) :pass)
       (multiple-value-bind (verdict detail) (check-contract contract)
-        (cond ((and (eq verdict :fail) (eq phase :pre-flight))
-               (veto ps (contract-name contract) (or detail "check returned NIL")))
-              (t
-               (audit-contract-result ps contract phase verdict detail)
-               (when (eq verdict :fail)
-                 (return-from run-contracts
-                   (values :fail (contract-name contract))))))))))
+        (when (eq verdict :fail)
+          (veto ps (contract-name contract) (or detail "check returned NIL")))
+        (audit-contract-result ps contract :pre-flight verdict detail)))))
+
+(defun run-runtime-contracts (ps)
+  "Run every contract during a canary and audit each result. Returns :PASS,
+or (values :FAIL name) for the first failing contract. Contracts run outside
+any task, so a plain call reaches old code."
+  (let ((*contract-context* ps)
+        (*task-epochs* nil))
+    (dolist (contract (patch-set-contracts ps) :pass)
+      (multiple-value-bind (verdict detail) (check-contract contract)
+        (audit-contract-result ps contract :runtime verdict detail)
+        (when (eq verdict :fail)
+          (return (values :fail (contract-name contract))))))))
 
 (defun new (name)
   "Inside a contract check: the patch set's new implementation of NAME."
@@ -504,18 +575,13 @@ note anomalies from new code but never fall back to old code."
     (setf (method-patch-shim-method mp)
           (eval-method-redefinition (method-shim-form ps mp)))))
 
-(defun remove-method-shim (mp)
-  "Take MP's routing method off its generic function, if it is on."
-  (when (method-patch-shim-method mp)
-    (remove-method (fdefinition (method-patch-gf-name mp))
-                   (method-patch-shim-method mp))
-    (setf (method-patch-shim-method mp) nil)))
-
 (defun remove-method-shims (ps &key (world :old))
-  "Replace method shims with one world: :old for rollback, :new for promotion."
+  "Replace method shims with one world: :old for rollback, :new for promotion.
+Adding a method with the shim's qualifiers and specializers replaces the shim
+in one step, so no call finds the generic function without a patched method."
   (dolist (mp (patch-set-method-patches ps))
-    (remove-method-shim mp)
     (ecase world
       (:old (add-method (fdefinition (method-patch-gf-name mp))
                         (method-patch-old-method mp)))
-      (:new (eval-method-redefinition (promoted-method-form mp))))))
+      (:new (eval-method-redefinition (promoted-method-form mp))))
+    (setf (method-patch-shim-method mp) nil)))

@@ -17,9 +17,12 @@
 ;;;;
 ;;;; Limitations:
 ;;;; - contracts run at COMMIT (inside INSTALL), not PREPARE.
-;;;; - members ramp independently; the conductor gates only rollback (T3).
-;;;; - no partition handling and no timeouts; a transport reports a dead
-;;;;   link as (:gone).
+;;;; - members ramp and promote independently; the conductor gates only
+;;;;   rollback, never promotion.
+;;;; - no partition handling, and the conductor has no timeouts of its own; a
+;;;;   transport reports a dead link as (:gone). A member's watch reports
+;;;;   :STALLED after 2 minutes and gives up after 12 with the pseudo-state
+;;;;   :WATCH-EXPIRED, so the conductor always hears an end.
 
 (in-package #:splice/cluster)
 
@@ -45,7 +48,7 @@ VALUE holds *only* keywords, strings, integers, and lists"
   (splice:sha256-hex (canonical-text (spec-without-hash spec))))
 
 (defun spec-with-hash (spec)
-  "SPEC wiht :HASH set to its SPEC-HASH as the first field"
+  "SPEC with :HASH set to its SPEC-HASH as the first field"
   (list* :hash (spec-hash spec) (spec-without-hash spec)))
 
 (defun spec-with-error-rates (spec alpha-ppm beta-ppm)
@@ -145,8 +148,7 @@ or PATCH-VETOED when a static check refuses."
             :name (intern (spec-field spec :name) package)
             :description (getf spec :description)
             :ramp (spec-field spec :ramp)
-            :sprt-min-n (spec-field spec :min-n)
-            :sprt-max-n (spec-field spec :max-n)
+            :stage-limit (spec-field spec :stage-limit)
             :fn-patches (mapcar (lambda (entry) (spec-fn-patch entry package))
                                 (getf spec :functions))
             :class-patches (mapcar (lambda (entry) (spec-class-patch entry package))
@@ -201,9 +203,12 @@ or PATCH-VETOED when a static check refuses."
                 :rollback-sent rollback-sent))
 
 (defun empty-cluster (alpha beta)
-  "Cluster wiht no members, whose pooled SPRT rejects at Wald's upper
-for ALPHA and BETA (as each member's SPRT does)"
-  (make-cluster :upper-milli (round (* 1000 (log (/ (- 1d0 beta) alpha))))))
+  "Cluster with no members, whose pooled error test rejects at 2/ALPHA.
+That is a single stage's share: each member's own tests reject at one over
+TEST-ALPHA, split across every stage, and the pooled test takes no share of
+that split. BETA sizes stage budgets, not this threshold."
+  (declare (ignore beta))
+  (make-cluster :upper-milli (round (* 1000 (log (/ 2d0 alpha))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Reading and rebuilding the value
@@ -292,7 +297,7 @@ for ALPHA and BETA (as each member's SPRT does)"
                 (broadcast cluster (list :prepare :spec spec)))))
 
 (defun step-receive (cluster id message)
-  "Conductor's response ot MESSAGE from member ID. Fold the message into the
+  "Conductor's response to MESSAGE from member ID. Fold the message into the
 member's view + do whatever the cluster now calls for."
   (let ((view (find-view cluster id)))
     (cond ((not (message-p message))
@@ -500,7 +505,7 @@ the set's last transition"))
 
 (defun make-conductor (&key adapter (alpha 0.01d0) (beta 0.05d0))
   "A conductor with no members. Every message goes through SEND-TO-MEMBER
-on ADAPTER. It goes in teh order it decided them and holds its lock"
+on ADAPTER. It goes in the order it decided them and holds its lock"
   (let ((alpha-ppm (round (* alpha 1000000)))
         (beta-ppm (round (* beta 1000000))))
     (%make-conductor adapter alpha-ppm beta-ppm
@@ -612,16 +617,27 @@ Returns the state it waited for, :TIMEOUT or :NOT-ROLLING-BACK"
         (member-reply cluster-member (list :veto :reason (princ-to-string e)))))))
 
 (defun start-terminal-watch (cluster-member ps)
-  "Thread that tells conductor once PS reaches a terminal state or what state it
-is in after 2 minutes"
+  "Thread that sends conductor :TERMINAL with the state WATCH-FOR-TERMINAL
+returns, so conductor always hears an end from this member"
   (sb-thread:make-thread
    (lambda ()
-     (let ((terminal '(:promoted :rolled-back :frozen)))
-       (when (eq :timeout (splice:wait-for-state ps terminal :timeout 120))
-         (member-reply cluster-member (list :stalled :state (splice:patch-set-state ps)))
-         (loop while (eq :timeout (splice:wait-for-state ps terminal :timeout 60))))
-       (member-reply cluster-member (list :terminal :state (splice:patch-set-state ps)))))
+     (member-reply cluster-member
+                   (list :terminal :state (watch-for-terminal cluster-member ps))))
    :name (format nil "splice-member-watch-~a" (splice:patch-set-name ps))))
+
+(defun watch-for-terminal (cluster-member ps)
+  "Wait for PS to reach a terminal state. After 2 minutes without one it sends
+:STALLED, which makes conductor roll the cluster back, and waits 10 more.
+Returns the terminal state, or :WATCH-EXPIRED when the set never reached one,
+a pseudo-state like the conductor's :DIED"
+  (let* ((terminal '(:promoted :rolled-back :frozen))
+         (first-wait (splice:wait-for-state ps terminal :timeout 120)))
+    (if (eq first-wait :timeout)
+        (progn
+          (member-reply cluster-member (list :stalled :state (splice:patch-set-state ps)))
+          (let ((second-wait (splice:wait-for-state ps terminal :timeout 600)))
+            (if (eq second-wait :timeout) :watch-expired second-wait)))
+        first-wait)))
 
 (defun member-rollback (cluster-member)
   "Roll set back if it is still 'canary-ing', otherwise answer :CONTINUE since3
@@ -650,13 +666,14 @@ the conductor gates only rollback"
                            extra)))))
 
 (defun health-message (ps)
-  "PS's error SPRT as a :HEALTH message, with the LLR in thousandths"
-  (let ((sprt (splice::patch-set-sprt-error ps)))
+  "PS's error test as a :HEALTH message, with the log odds in thousandths"
+  (let ((stage (splice::patch-set-stage ps)))
     (list :health
           :state (splice:patch-set-state ps)
           :fraction (splice::patch-set-current-fraction ps)
-          :n (splice:sprt-n sprt)
-          :llr-milli (round (* 1000 (splice:sprt-llr sprt))))))
+          :n (splice::canary-stage-observations stage)
+          :llr-milli (round (* 1000 (splice:mixture-log-odds
+                                     (splice::canary-stage-error-test stage)))))))
 
 (defun member-send-health (cluster-member)
   "Send the conductor the member's current SPRT health. The host's workload

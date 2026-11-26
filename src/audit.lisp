@@ -14,6 +14,8 @@
   ;; mutable
   (seq 0)
   (prev-hash "genesis")
+  ;; length of the file through the last synced entry
+  (octets 0)
   ;; bounded in-memory tail, newest first. the file source of truth
   (lines '())
   (lines-count 0)
@@ -115,7 +117,8 @@ SEQ and HASH, then syncs the directory. Returns the log"
     (call-closing-on-error checkpoint (lambda () (sync-directory path)))
     (setf *audit-log* (%make-audit-log :path path :stream stream
                                        :checkpoint checkpoint
-                                       :seq seq :prev-hash hash))))
+                                       :seq seq :prev-hash hash
+                                       :octets (file-length stream)))))
 
 (defun delete-audit-log (path)
   "Delete the log at PATH, for a caller that means to start it again.
@@ -193,7 +196,8 @@ the new seq. A write that signals is recorded on LOG"
     (write-line line (audit-log-stream log))
     (fsync-stream (audit-log-stream log))
     (incf (audit-log-seq log))
-    (setf (audit-log-prev-hash log) (sha256-hex line))
+    (setf (audit-log-prev-hash log) (sha256-hex line)
+          (audit-log-octets log) (file-position (audit-log-stream log)))
     (remember-line log line)
     (write-checkpoint (audit-log-checkpoint log)
                       (audit-log-seq log) (audit-log-prev-hash log))
@@ -222,6 +226,46 @@ once a write to the log has failed"
 
 ;;; ---------------------------------------------------------------------
 ;;; Offline: chain verification
+;;; A reader of the log this process has open reads only through its last
+;;; synced entry and checks it against the head in memory. Writers on other
+;;; threads append past that point and overwrite the checkpoint while the
+;;; reader works, so reading to the end of the file, or reading the
+;;; checkpoint file, could catch a line or the checkpoint mid-write.
+
+(defstruct (log-head (:constructor make-log-head (octets seq hash)))
+  (octets 0 :read-only t)
+  (seq 0 :read-only t)
+  (hash "genesis" :read-only t))
+
+(defun same-file-p (path other)
+  "True when PATH and OTHER name one existing file"
+  (let ((truename (probe-file path)))
+    (and truename (equal truename (probe-file other)))))
+
+(defun live-head (path)
+  "The head of the log at PATH as of its last synced entry, when PATH is the
+open *AUDIT-LOG*. :NOT-LIVE for any other log"
+  (let ((log *audit-log*))
+    (if (and log (same-file-p path (audit-log-path log)))
+        (sb-thread:with-mutex ((audit-log-lock log))
+          (if (open-stream-p (audit-log-stream log))
+              (make-log-head (audit-log-octets log) (audit-log-seq log)
+                             (audit-log-prev-hash log))
+              :not-live))
+        :not-live)))
+
+(defun readable-end (path)
+  "Octet offset a reader of the log at PATH stops at: the end of its last
+synced entry when it is the open *AUDIT-LOG*, otherwise :EOF"
+  (let ((head (live-head path)))
+    (if (eq head :not-live) :eof (log-head-octets head))))
+
+(defun read-line-before (in end)
+  "The next line from IN and whether it lacks a newline. :END at end of file,
+or once IN has read END octets when END is an offset"
+  (if (and (integerp end) (>= (file-position in) end))
+      :end
+      (read-line in nil :end)))
 
 (defun read-entry-or-unreadable (line)
   "The entry LINE holds or :UNREADABLE"
@@ -231,18 +275,20 @@ once a write to the log has failed"
                       :unreadable))
     (error () :unreadable)))
 
-(defun map-audit-entries (path fn &key (verify t))
-  "Call FN on each entry of the log at PATH, verifying the hash chain.
-Returns (values ok count break-seq reason). REASON is :INTACT, :HASH-MISMATCH,
+(defun map-audit-entries (path fn &key (verify t) (end (readable-end path)))
+  "Call FN on each entry of the log at PATH, verifying the hash chain, up to
+octet END or to the end of the file when END is :EOF. Returns (values ok
+count break-seq reason last-hash). REASON is :INTACT, :HASH-MISMATCH,
 :UNREADABLE (a whole line that doesn't read) or :TORN-TAIL (a last line that
-doesn't read and has no newline, as a crash mid-write leaves). With VERIFY
-NIL, an unreadable line signals instead, so a reader that ignores OK never
-gets a short list. Streams, so large logs never sit in memory."
+doesn't read and has no newline, as a crash mid-write leaves). LAST-HASH is
+the hash of the last line read. With VERIFY NIL, an unreadable line signals
+instead, so a reader that ignores OK never gets a short list. Streams, so
+large logs never sit in memory."
   (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
     (let ((expected "genesis")
           (count 0))
-      (loop for (line missing-newline-p) = (multiple-value-list (read-line in nil nil))
-            while line
+      (loop for (line missing-newline-p) = (multiple-value-list (read-line-before in end))
+            until (eq line :end)
             do (let ((entry (read-entry-or-unreadable line)))
                  (when (eq entry :unreadable)
                    (unless verify
@@ -257,19 +303,39 @@ gets a short list. Streams, so large logs never sit in memory."
                  (setf expected (sha256-hex line))
                  (incf count)
                  (when fn (funcall fn entry))))
-      (values t count nil :intact))))
+      (values t count nil :intact expected))))
 
 (defun verify-audit-chain (path)
   "Verify the hash chain of the log at PATH + checkpoint. Returns
 (values ok entry-count break-seq reason).
-REASON is MAP-AUDIT-ENTRIES or CHECK-ANCHOR's (when chain holds, checkpoint doesn't)"
-  (multiple-value-bind (ok count break-seq reason) (map-audit-entries path nil)
+REASON is MAP-AUDIT-ENTRIES or CHECK-ANCHOR's (when chain holds, checkpoint doesn't).
+The open *AUDIT-LOG* is checked against its head in memory, which its
+checkpoint mirrors, rather than against the checkpoint file"
+  (let ((head (live-head path)))
+    (if (eq head :not-live)
+        (verify-chain-and-checkpoint path)
+        (verify-chain-to-head path head))))
+
+(defun verify-chain-and-checkpoint (path)
+  "VERIFY-AUDIT-CHAIN for a log no one in this process is writing"
+  (multiple-value-bind (ok count break-seq reason) (map-audit-entries path nil :end :eof)
     (if (not ok)
         (values nil count break-seq reason)
         (let ((anchor (check-anchor path)))
           (if (eq anchor :anchored)
               (values t count nil :intact)
               (values nil count nil anchor))))))
+
+(defun verify-chain-to-head (path log-head)
+  "VERIFY-AUDIT-CHAIN for the open log, read through LOG-HEAD's octets. The
+last entry read must be LOG-HEAD's, otherwise the log is :TRUNCATED"
+  (multiple-value-bind (ok count break-seq reason last-hash)
+      (map-audit-entries path nil :end (log-head-octets log-head))
+    (cond ((not ok) (values nil count break-seq reason))
+          ((and (= count (log-head-seq log-head))
+                (equal last-hash (log-head-hash log-head)))
+           (values t count nil :intact))
+          (t (values nil count nil :truncated)))))
 
 (defun last-two-lines (path)
   "Last line of the file at PATH and the one before it. Each can be :EMPTY"

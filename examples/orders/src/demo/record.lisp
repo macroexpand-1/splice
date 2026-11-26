@@ -3,6 +3,9 @@
 
 (in-package #:splice-orders/demo)
 
+(defconstant +recording-version+ 1
+  "Changes whenever the recording header changes meaning or shape")
+
 (defstruct (play-position (:constructor make-position (&key hold)))
   (lock (sb-thread:make-mutex :name "demo-player-position") :read-only t)
   (hold nil :read-only t)
@@ -48,7 +51,7 @@ recordings/act-2-seed-2002-20261028T170211.sexp in placed in the example's tree.
 (defun splice-commit ()
   "Short commit from splice's checkout with -dirty if necessary or \"unknown\""
   (handler-case
-      (string-trim `(#\Newline #\Space)
+      (string-trim '(#\Newline #\Space)
                    (uiop:run-program (list "git" "-C" (namestring (asdf:system-source-directory "splice"))
                                            "describe" "--always" "--dirty" "--abbrev=7")
                                      :output :string))
@@ -59,7 +62,7 @@ recordings/act-2-seed-2002-20261028T170211.sexp in placed in the example's tree.
   "First line of recording of ACT run with SETTINGS, written to the audit log at LOG-PATH.
 It's a plist of :seed :fault :threads :pre-existing, plus the log's path and this boot's id
 so a recording can be matched to its log"
-  (list :recording 1
+  (list :recording +recording-version+
         :snapshot-version +snapshot-version+
         :splice-commit (splice-commit)
         :started (splice::timestamp-string)
@@ -89,7 +92,7 @@ COMMIT NIL skips the commit check."
       (values (recording-status header snapshots commit) header snapshots))))
 
 (defun recording-status (header snapshots commit)
-  (cond ((not (and (consp header) (eql 1 (getf header :recording)))) :wrong-recording-version)
+  (cond ((not (and (consp header) (eql +recording-version+ (getf header :recording)))) :wrong-recording-version)
         ((zerop (length snapshots)) :empty)
         ((notevery #'current-version-p (cons header (coerce snapshots 'list)))
          :wrong-snapshot-version)

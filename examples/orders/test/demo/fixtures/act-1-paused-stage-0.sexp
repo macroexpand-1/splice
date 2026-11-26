@@ -15,7 +15,7 @@
  :threads ((:name "orders-worker-0" :pins ())
            (:name "orders-worker-1" :pins ())
            (:name "orders-worker-2" :pins ()))
- :sprt (:stage 0 :trimmed nil :upper 4.553877 :lower -2.985682 :min-n 50
+ :sprt (:stage 0 :trimmed nil :upper 5.2983174 :budget 9004
         :errors ()
         :slow ())
  :faults ())

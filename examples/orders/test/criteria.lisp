@@ -1,11 +1,14 @@
-;;;; criteria.lisp: executes every success criterion and writes
-;;;; artifacts/criteria-report.md (under examples/orders/) with the measured
-;;;; numbers. From the repository root:
+;;;; criteria.lisp: measures the success criteria that move with chance or
+;;;; with the machine (detection rates, false rejects, operating
+;;;; characteristics, shim overhead) and writes artifacts/criteria-report.md
+;;;; (under examples/orders/) with the numbers. The criteria workflow
+;;;; (.github/workflows/criteria.yml) runs this weekly and on demand, fails on
+;;;; a missed criterion, and uploads the report. From the repository root:
 ;;;;
 ;;;;   sbcl --non-interactive --eval '(require :asdf)' \
 ;;;;        --eval '(asdf:load-asd (truename "splice.asd"))' \
 ;;;;        --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))' \
-;;;;        --eval '(asdf:test-system "splice-orders/criteria")'     ; full (~2-4 min)
+;;;;        --eval '(asdf:test-system "splice-orders/criteria")'     ; full (~15 min)
 ;;;;
 ;;;; SPLICE_RUNS=20 in the environment gives a quicker run. TEST-OP signals
 ;;;; an error when any criterion fails, so a non-interactive run exits
@@ -24,7 +27,9 @@
 (defvar *failures* '())
 (defvar *report* '())
 (defvar *batches* '())
-(defvar *big-log* nil "The log every section after the checkpoints shares.")
+(defvar *big-log* nil "The log the session batches and the overhead run share.")
+(defvar *oc-rows* '() "One row per traffic shape the C8 run measured, newest first")
+(defparameter *oc-fraction* 25 "The stage every C8 run canaries at")
 
 ;;; ---------------------------------------------------------------------
 ;;; Helpers
@@ -61,183 +66,6 @@
     (list (max 0.0 (- center half)) (min 1.0 (+ center half)))))
 
 ;;; ---------------------------------------------------------------------
-;;; C5a: reconstruction checkpoints
-;;; Own log, so the fold is single-session.
-
-(defun check-reconstruction-checkpoints ()
-  (format t "~%--- reconstruction checkpoints (pre-patch / mid-canary / post-rollback)~%")
-  (let ((log (fresh-scratch-log "splice-criteria-checkpoint.log")))
-    (splice:open-audit-log log)
-    (orders:reset-workload)
-    (let ((ps (orders:register-currency-patch-set)))
-      (check "Checkpoint: pre-patch reconstruction"
-             (splice:verify-reconstruction log) nil)
-      (splice:install ps)
-      (loop for i from 1 to 400
-            do (splice:with-task (:id i :swallow-errors t)
-                 (orders:process-order (make-instance 'orders:order :id i :item-count 2
-                                                                    :unit-price 10.0))))
-      (multiple-value-bind (ok mism state) (splice:verify-reconstruction log)
-        (check "Checkpoint: mid-canary reconstruction"
-               (and ok (splice::canary-stage-p
-                        (cdr (assoc (splice:patch-set-name ps) (getf state :sets)))))
-               (or mism (cdr (assoc (splice:patch-set-name ps) (getf state :sets))))))
-      (splice:roll-back ps :operator "criteria")
-      (splice:wait-for-state ps '(:rolled-back :frozen))
-      (check "Checkpoint: post-rollback reconstruction"
-             (splice:verify-reconstruction log) nil))
-    (splice:close-audit-log)))
-
-;;; ---------------------------------------------------------------------
-;;; Resume after a hard trigger
-;;; Own log, like the checkpoints.
-
-(defun check-resume-after-hard-trigger ()
-  (format t "~%--- resume after a hard trigger on a lossy set~%")
-  (let ((log (fresh-scratch-log "splice-criteria-resume.log")))
-    (splice:open-audit-log log)
-    (orders:reset-workload)
-    (let ((corrupted (first (orders:make-pre-existing-orders (orders:make-rng 41) 1 :corrupted 1)))
-          (ps (orders:register-currency-patch-set :lossy t)))
-      (splice:install ps)
-      ;; the corrupted order fails forward migration and arms the hard trigger;
-      ;; a lossy set freezes for a human rather than rolling back
-      (let ((orders:*fault* (orders:make-fault :kind :migration)))
-        (splice:with-task (:id 1 :swallow-errors t)
-          (orders:process-order corrupted)))
-      (check "Resume: hard trigger freezes a lossy set for a human"
-             (and (eq (splice:patch-set-state ps) :frozen)
-                  (eq (first (splice::patch-set-freeze-reason ps))
-                      :lossy-reversal-needs-human))
-             (list (splice:patch-set-state ps) (splice::patch-set-freeze-reason ps)))
-      (splice:unfreeze ps :resume :operator "criteria")
-      (splice:with-task (:id 2 :swallow-errors t)
-        (orders:process-order (orders:make-test-order)))
-      (check "Resume: unfreeze :resume survives the next task"
-             (splice::canary-stage-p (splice:patch-set-state ps))
-             (splice:patch-set-state ps)))
-    (orders:reset-workload)
-    (splice:close-audit-log)))
-
-;;; ---------------------------------------------------------------------
-;;; Runtime contracts
-;;; They see old code on the old route. Own log.
-
-(defun route-probe (x)
-  "Old side of the probe patch: names the code that ran. Call it through its
-symbol: SBCL derives :OLD as the return type of a same-file DEFUN and would
-type-check the shim's :NEW into an error."
-  (declare (ignore x))
-  :old)
-
-(defun join-rollback-thread (ps)
-  "Wait for PS's rollback thread, which audits after its last state change."
-  (let ((name (format nil "splice-rollback-~a" (splice:patch-set-name ps))))
-    (dolist (thread (sb-thread:list-all-threads))
-      (when (equal (sb-thread:thread-name thread) name)
-        (sb-thread:join-thread thread :default nil)))))
-
-(defun check-runtime-contract-routing ()
-  (format t "~%--- runtime contracts call old code through the shims~%")
-  (let* ((log (fresh-scratch-log "splice-criteria-runtime-contract.log"))
-         (seen '())
-         (ps (splice::make-patch-set
-              :name 'route-probe-patch
-              :ramp '(50)
-              :runtime-contract-interval 10
-              :fn-patches
-              (list (splice::make-fn-patch
-                     :name 'route-probe
-                     :new-fn (lambda (x) (declare (ignore x)) :new)
-                     :new-source '(route-probe-new)
-                     :new-source-hash (splice:sha256-hex "route-probe-new")))
-              :contracts
-              (list (splice::make-contract
-                     :name 'old-call-reaches-old-code
-                     ;; a plain call is the contract's "old" side; it must
-                     ;; reach old code at pre-flight and at runtime alike
-                     :check-fn (lambda ()
-                                 (let ((ran (funcall 'route-probe 1)))
-                                   (push ran seen)
-                                   (eq ran :old)))
-                     :source '(old-call-reaches-old-code))))))
-    (splice:open-audit-log log)
-    (splice:unregister-patch-set 'route-probe-patch)
-    (splice:register-patch-set ps)
-    (splice:install ps)
-    ;; about half of these route :new; every tenth canary observation runs
-    ;; the contracts from inside that task's cleanup
-    (loop for i from 1 to 60
-          do (splice:with-task (:id i) (funcall 'route-probe i)))
-    (check "Runtime contract: a plain call inside a canary task reaches old code"
-           (and (> (length seen) 1)
-                (every (lambda (ran) (eq ran :old)) seen))
-           (reverse seen))
-    (when (splice::canary-stage-p (splice:patch-set-state ps))
-      (splice:roll-back ps :operator "criteria"))
-    (splice:wait-for-state ps '(:rolled-back :frozen))
-    (join-rollback-thread ps)
-    (splice:unregister-patch-set 'route-probe-patch)
-    (splice:close-audit-log)))
-
-;;; ---------------------------------------------------------------------
-;;; C4 pre-work: pristine signature
-;;; The workload signature, captured before any patch.
-
-(defun workload-signature (seed n)
-  "Totals from N seeded orders run against whatever code and class shape are
-live now. It does not reset the workload, so the post-rollback capture sees
-what the rollback left behind."
-  (let ((rng (orders:make-rng seed)))
-    (loop for i from 1 to n
-          collect (splice:with-task (:id i)
-                    (orders:process-order
-                     (make-instance 'orders:order :id i
-                                                  :item-count (orders:rng-range rng 1 9)
-                                                  :unit-price (/ (orders:rng-range rng 100 9999) 100.0)
-                                                  :discount-code (case (mod (orders:rng-next rng) 5)
-                                                                   (0 "TEN") (1 "VIP") (t nil))))))))
-
-;;; ---------------------------------------------------------------------
-;;; C1: the flagship scenario
-
-(defun check-flagship ()
-  (format t "~%--- C1: flagship, 3 functions + method + class, latent fault, 5/25/100 ramp~%")
-  (let ((r (orders:run-canary-session :fault :latent :seed 4242 :quiet t)))
-    (check "Flagship: fault caught and rolled back"
-           (eq (orders:session-result-final-state r) :rolled-back)
-           (orders:session-result-final-state r))
-    (let ((cmp (orders:session-result-post-rollback-comparison r)))
-      (check "Flagship: fdefinitions EQ to originals" (getf cmp :fdefinitions-eq) cmp)
-      (check "Flagship: class shape restored" (getf cmp :class-shape-original) nil)
-      (check "Flagship: every pre-existing instance restored to snapshot"
-             (and cmp (= (getf cmp :snapshot-restored) (getf cmp :snapshot-total)))
-             (format nil "~a/~a" (getf cmp :snapshot-restored)
-                     (getf cmp :snapshot-total))))
-    (let* ((report (orders:session-result-reversal-report r))
-           (rev (and (listp report) (first report))))
-      ;; a report exists only when every instance reversed: the first
-      ;; failure aborts the rollback and freezes the set
-      (check "Flagship: reverse migration completed without failures"
-             (and rev t)
-             rev)
-      (check "Flagship: journal-exact restorations occurred (instances were
-migrated forward mid-canary, then restored)"
-             (and rev (plusp (getf rev :journal-exact))) rev))))
-
-;;; ---------------------------------------------------------------------
-;;; C4: post-rollback workload
-;;; Identical to the never-patched control.
-
-(defun check-post-rollback-workload (pristine)
-  (let ((post (workload-signature 777 300)))
-    (check "C4: post-rollback workload identical to never-patched control"
-           (equal pristine post)
-           (format nil "~a/~a totals equal"
-                   (count t (mapcar #'equal pristine post))
-                   (length post)))))
-
-;;; ---------------------------------------------------------------------
 ;;; C2/C6: fault matrix and statistical honesty
 ;;; Over *RUNS* sessions per fault class.
 
@@ -251,9 +79,16 @@ migrated forward mid-canary, then restored)"
           do (setf best (max best (parse-integer (subseq (symbol-name state) 7))))
         finally (return best)))
 
+(defun print-session-dot ()
+  "One dot as each session starts, so a long batch shows it is moving"
+  (write-char #\.)
+  (finish-output))
+
 (defun run-batch (kind &key threads)
+  "Run *RUNS* sessions with fault KIND, a dot printed per session"
   (let ((b (make-batch :kind kind :runs *runs*)))
     (dotimes (i *runs*)
+      (print-session-dot)
       (let* ((r (orders:run-canary-session :fault kind
                                            :seed (+ 10000 (* 131 i)
                                                     (if kind (sxhash kind) 0))
@@ -265,19 +100,22 @@ migrated forward mid-canary, then restored)"
           (push (orders:session-result-detection-observations r) (batch-detect-ns b))
           (push (orders:session-result-tasks-run r) (batch-detect-tasks b))
           (push (highest-canary-stage r) (batch-stages b)))))
+    (terpri)
     b))
 
 (defun check-clean-batch ()
   "Spurious rollbacks of a clean patch measure the realized false-positive rate."
-  (format t "clean batch...~%")
+  (format t "clean batch ")
   (let ((b (run-batch nil)))
     (push (cons :clean b) *batches*)
     (let* ((k (batch-caught b))        ; every rollback of a clean patch is spurious
            (ci (wilson-ci k *runs*))
            (promoted (batch-count :promoted b)))
-      (check (format nil "C6: clean-patch spurious rollbacks ~a/~a, 95% CI [~,4f, ~,4f] contains alpha=0.01"
+      ;; alpha bounds a session's whole chance of a spurious rollback, so the
+      ;; realized rate only has to be no worse: the CI must reach down to alpha
+      (check (format nil "C6: clean-patch spurious rollbacks ~a/~a, 95% CI [~,4f, ~,4f] reaches alpha=0.01 or below"
                      k *runs* (first ci) (second ci))
-             (and (<= (first ci) 0.01) (<= 0.01 (second ci))
+             (and (<= (first ci) 0.01)
                   ;; and never via a nonsense route: a clean patch must mostly
                   ;; promote, and a frozen, vetoed or undecided session is not
                   ;; a promotion
@@ -289,7 +127,7 @@ migrated forward mid-canary, then restored)"
 
 (defun check-fault-batches ()
   (dolist (kind (orders:all-fault-kinds))
-    (format t "~a batch...~%" kind)
+    (format t "~a batch " kind)
     (let ((b (run-batch kind :threads (when (eq kind :load-correlated) 8))))
       (push (cons kind b) *batches*)
       (check (format nil "C2/C6: ~a detection rate ~a/~a >= 0.95 (1-beta)"
@@ -302,84 +140,6 @@ migrated forward mid-canary, then restored)"
                          at-5 at-25+)
                  (and (>= at-25+ (* 0.9 (batch-caught b))) (< at-5 (* 0.1 *runs*)))
                  nil))))))
-
-;;; ---------------------------------------------------------------------
-;;; C3: coherence
-;;; Promotion swaps only once the :old pins drain, so no task runs a mix of
-;;; old and new code; the sampled routes are checked offline.
-
-(defun hold-old-task (ps release)
-  "Start a thread whose task pins PS :old and waits for the semaphore
-RELEASE. Returns the thread once the pin is counted."
-  (let* ((fraction (splice::patch-set-current-fraction ps))
-         (id (loop for id from 1000000
-                   when (>= (splice::routing-draw id (splice:patch-set-name ps)) fraction)
-                     return id))
-         (thread (sb-thread:make-thread
-                  (lambda ()
-                    (splice:with-task (:id id :swallow-errors t)
-                      (sb-thread:wait-on-semaphore release)))
-                  :name "criteria-held-task")))
-    (loop until (plusp (splice::patch-set-pinned-old ps))
-          do (sleep 0.01))
-    thread))
-
-(defun every-shim-installed-p (ps)
-  (every (lambda (fp)
-           (eq (fdefinition (splice::fn-patch-name fp)) (splice::fn-patch-shim fp)))
-         (splice::patch-set-fn-patches ps)))
-
-(defun check-promotion-waits-for-drain ()
-  (format t "~%--- C3: promotion freezes rather than swap past an undrained :old task~%")
-  (let ((log (fresh-scratch-log "splice-criteria-drain.log"))
-        (release (sb-thread:make-semaphore))
-        (saved splice::*drain-timeout-seconds*))
-    (splice:open-audit-log log)
-    (orders:reset-workload)
-    (let ((ps (orders:register-currency-patch-set)))
-      (splice:install ps)
-      (let ((held (hold-old-task ps release)))
-        (unwind-protect
-             (progn
-               ;; global, not LET: the promotion thread reads it
-               (setf splice::*drain-timeout-seconds* 1)
-               (splice:promote ps :operator "criteria")
-               (check "C3: a promotion whose :old task never drains freezes instead of swapping"
-                      (and (eq :frozen (splice:wait-for-state ps '(:frozen :promoted) :timeout 10))
-                           (eq :promotion-drain-timeout
-                               (first (splice::patch-set-freeze-reason ps)))
-                           (every-shim-installed-p ps))
-                      (list (splice:patch-set-state ps) (splice::patch-set-freeze-reason ps))))
-          (setf splice::*drain-timeout-seconds* saved)
-          (sb-thread:signal-semaphore release)
-          (sb-thread:join-thread held))))
-    (orders:reset-workload)
-    (splice:close-audit-log)))
-
-(defun check-coherence ()
-  (format t "~%--- C3: offline coherence check from sampled task records~%")
-  (let ((checked 0) (bad 0))
-    (with-open-file (in *big-log*)
-      (let ((*read-eval* nil) (*package* (find-package :splice)))
-        (loop for line = (read-line in nil) while line
-              for entry = (ignore-errors (read-from-string line))
-              when (and entry (eq (getf entry :event) :task-sample))
-                do (dolist (pin (getf entry :pins))
-                     (let ((state (getf pin :state)))
-                       ;; draws only govern canary stages; :promoting pins :new,
-                       ;; draining states pin :old, by policy not by draw
-                       (when (splice::canary-stage-p state)
-                         (incf checked)
-                         (let* ((draw (splice::routing-draw
-                                       (getf entry :task)
-                                       (getf pin :patch-set)))
-                                (expect (if (< draw (getf pin :fraction))
-                                            :new :old)))
-                           (unless (eq expect (getf pin :route))
-                             (incf bad)))))))))
-    (check (format nil "C3: ~a sampled routes match the deterministic draw (~a bad)"
-                   checked bad)
-           (and (plusp checked) (zerop bad)) nil)))
 
 ;;; ---------------------------------------------------------------------
 ;;; C7: overhead
@@ -424,39 +184,149 @@ RELEASE. Returns the thread once the pin is counted."
                   plain shim-old (/ shim-old plain) shim-new promoted)
           (check (format nil "C7: canary shim overhead ~,2fx < 2x plain call"
                          (/ shim-old plain))
-                 (< (/ shim-old plain) 2.0) nil)
-          (check "C7: post-promotion shim is structurally gone (fdefinition EQ new implementation)"
-                 (eq (fdefinition 'orders:price-order) #'orders::new-price-order)
-                 nil))))))
+                 (< (/ shim-old plain) 2.0) nil))))))
 
 ;;; ---------------------------------------------------------------------
-;;; C5b: the whole criteria log
-;;; Chain intact, reconstruction matches the image.
+;;; C8: operating characteristics
+;;; The live evaluator fed synthetic outcome streams through REPORT-OUTCOME,
+;;; routed by the production draw. One stage per run, since the budget is a
+;;; per-stage promise; a one-stage ramp gives that stage the whole alpha.
 
-(defun check-audit-log ()
-  "Caller has closed *BIG-LOG*."
-  (format t "~%--- C5: audit chain + reconstruction over the full criteria log~%")
-  (multiple-value-bind (ok entry-count break-seq) (splice:verify-audit-chain *big-log*)
-    (check (format nil "C5: hash chain intact over ~a entries" entry-count)
-           ok break-seq))
-  (multiple-value-bind (ok mismatches) (splice:verify-reconstruction *big-log*)
-    (check "C5: final image state reconstructed from log matches live image"
-           ok mismatches))
-  ;; tamper detection
-  (let ((tampered (fresh-scratch-log "splice-criteria-tampered.log")))
-    (with-open-file (in *big-log*)
-      (with-open-file (out tampered :direction :output :if-exists :supersede)
-        (loop for line = (read-line in nil) while line
-              for i from 0
-              do (write-line (if (= i 100) (substitute #\7 #\2 line :count 1) line)
-                             out))))
-    (multiple-value-bind (ok entry-count break-seq) (splice:verify-audit-chain tampered)
-      (declare (ignore entry-count))
-      (check "C5: tampering detected by chain verification"
-             (and (not ok) break-seq) break-seq))))
+(defstruct (traffic (:copier nil))
+  (label "" :read-only t)
+  (error-rate 0.01d0 :read-only t)
+  (error-ratio 1d0 :read-only t)
+  (latency-factor 1d0 :read-only t)
+  (burst-period 0 :read-only t)
+  (burst-length 0 :read-only t)
+  (burst-rate 0d0 :read-only t)
+  (burst-arms :both :read-only t)
+  (harmful nil :read-only t))
+
+(defun oc-traffic-shapes ()
+  (list (make-traffic :label "Healthy")
+        (make-traffic :label "Healthy, shared bursts"
+                      :burst-period 1000 :burst-length 100 :burst-rate 0.1d0)
+        (make-traffic :label "Latency 1.1x" :latency-factor 1.1d0 :harmful t)
+        (make-traffic :label "Latency 1.2x" :latency-factor 1.2d0 :harmful t)
+        (make-traffic :label "Latency 1.3x" :latency-factor 1.3d0 :harmful t)
+        (make-traffic :label "Latency 1.5x" :latency-factor 1.5d0 :harmful t)
+        (make-traffic :label "Latency 2x" :latency-factor 2d0 :harmful t)
+        (make-traffic :label "Errors 1.3x" :error-ratio 1.3d0 :harmful t)
+        (make-traffic :label "Errors 2x" :error-ratio 2d0 :harmful t)
+        (make-traffic :label "Bursty fault, new arm only"
+                      :burst-period 1000 :burst-length 100 :burst-rate 0.1d0
+                      :burst-arms :new :harmful t)))
+
+(defun in-burst-p (traffic route task-id)
+  (and (plusp (traffic-burst-period traffic))
+       (< (mod task-id (traffic-burst-period traffic)) (traffic-burst-length traffic))
+       (or (eq (traffic-burst-arms traffic) :both) (eq route :new))))
+
+(defun failure-probability (traffic route task-id)
+  (let ((base (if (in-burst-p traffic route task-id)
+                  (traffic-burst-rate traffic)
+                  (traffic-error-rate traffic))))
+    (if (eq route :new)
+        (min 1d0 (* base (traffic-error-ratio traffic)))
+        base)))
+
+(defun draw-latency-ms (traffic route rng)
+  "1ms plus an exponential with mean 1ms, scale on the new arm"
+  (let ((base (+ 1d0 (- (log (- 1d0 (orders::rng-uniform rng)))))))
+    (if (eq route :new) (* base (traffic-latency-factor traffic)) base)))
+
+(defun oc-probe-set (min-effect)
+  "A bar set canarying at *OC-FRACTION*. No shims, so no task runs code"
+  (let ((ps (splice::make-patch-set :name 'oc-probe :ramp (list *oc-fraction*)
+                                    :min-effect min-effect
+                                    :runtime-contract-interval 0
+                                    :control-ring (splice::make-control-ring)
+                                    :null-ring (splice::make-control-ring
+                                                :size splice::*null-ring-size*))))
+    (splice::with-set-lock (ps) (splice::enter-stage ps 0))
+    ps))
+
+(defun feed-task (ps traffic task-id rng)
+  "Route TASK-ID by the production draw and report one synthetic outcome"
+  (let ((route (if (< (splice::routing-draw task-id 'oc-probe) *oc-fraction*) :new :old)))
+    (splice::report-outcome ps route
+                            (< (orders::rng-uniform rng)
+                               (failure-probability traffic route task-id))
+                            (draw-latency-ms traffic route rng))))
+
+(defun run-oc-stage (traffic seed &key (min-effect 0.3d0))
+  "Feed one stage until it reaches a decision point. Returns the point and
+the stage's :new observations at it."
+  (let ((ps (oc-probe-set min-effect))
+        (rng (orders:make-rng seed))
+        (point (list :none)))
+    (splice:with-operator-decisions
+      (handler-bind ((splice:operator-decision
+                       (lambda (c)
+                         (setf (car point) (splice:operator-decision-point c))
+                         (splice:freeze-patch c))))
+        (loop for task-id from 1
+              until (not (eq (car point) :none))
+              do (feed-task ps traffic task-id rng))))
+    (values (car point)
+            (splice::canary-stage-observations (splice::patch-set-stage ps)))))
+
+(defun measure-traffic (traffic)
+  "Run *RUNS* stages of TRAFFIC; returns a row plist."
+  (let ((points '()) (detect-ns '()))
+    (dotimes (i *runs*)
+      (multiple-value-bind (point n) (run-oc-stage traffic (+ 5000 (* 131 i)))
+        (push point points)
+        (when (eq point :sprt-reject) (push n detect-ns))))
+    (list :traffic traffic
+          :rejects (count :sprt-reject points)
+          :passes (count :budget-pass points)
+          :timeouts (count :stage-timeout points)
+          :confounded (count :confounded points)
+          :median-n (median detect-ns))))
+
+(defun check-operating-characteristics ()
+  (format t "~%--- C8: operating characteristics at ~a%, ~a runs per shape~%"
+          *oc-fraction* *runs*)
+  (setf *oc-rows* '())
+  (dolist (traffic (oc-traffic-shapes))
+    (push (measure-traffic traffic) *oc-rows*))
+  (dolist (row (reverse *oc-rows*))
+    (let* ((traffic (getf row :traffic))
+           (k (getf row :rejects))
+           (ci (wilson-ci k *runs*)))
+      (cond ((not (traffic-harmful traffic))
+             (check (format nil "C8: ~a false rejects ~a/~a, 95% CI [~,4f, ~,4f] not above alpha"
+                            (traffic-label traffic) k *runs* (first ci) (second ci))
+                    (<= (first ci) 0.01) nil))
+            ((string= "Latency 1.3x" (traffic-label traffic))
+             (check (format nil "C8: latency 1.3x rejected ~a/~a, 95% CI [~,4f, ~,4f] reaches 0.95"
+                            k *runs* (first ci) (second ci))
+                    (>= (second ci) 0.95) nil))))))
+
+(defun write-oc-table (out)
+  (format out "~%## Operating Characteristics (C8, One Stage at ~a%, n=~a Runs Each)~%~%"
+          *oc-fraction* *runs*)
+  (format out "| Traffic | Rejected | Passed | Timed Out | Confounded | Median New-Arm n to Reject |~%|---|---|---|---|---|---|~%")
+  (dolist (row (reverse *oc-rows*))
+    (format out "| ~a | ~a | ~a | ~a | ~a | ~a |~%"
+            (traffic-label (getf row :traffic))
+            (getf row :rejects) (getf row :passes) (getf row :timeouts)
+            (getf row :confounded)
+            (or (getf row :median-n) "N/A"))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Report
+
+(defun report-commit ()
+  "Short commit of splice's checkout, with -dirty when it has changes, or \"unknown\""
+  (handler-case
+      (string-trim '(#\Newline #\Space)
+                   (uiop:run-program (list "git" "-C" (namestring (root))
+                                           "describe" "--always" "--dirty" "--abbrev=7")
+                                     :output :string))
+    (error () "unknown")))
 
 (defun write-report ()
   (with-open-file (out (ensure-directories-exist
@@ -465,6 +335,7 @@ RELEASE. Returns the thread once the pin is counted."
     (format out "# Criteria Report~%~%")
     (format out "Generated by `test/criteria.lisp` (~a runs per class) on ~a, ~a.~%~%"
             *runs* (lisp-implementation-type) (lisp-implementation-version))
+    (format out "Commit ~a, written ~a.~%~%" (report-commit) (splice::timestamp-string))
     (format out "## Verdicts~%~%")
     (format out "| Criterion | Result |~%|---|---|~%")
     (dolist (entry (reverse *report*))
@@ -481,6 +352,7 @@ RELEASE. Returns the thread once the pin is counted."
                 (or (median (batch-detect-tasks b)) "N/A")
                 (let ((s (remove-duplicates (batch-stages b))))
                   (if s (format nil "~{~a%~^, ~}" (sort s #'<)) "N/A")))))
+    (write-oc-table out)
     (let ((oh (find-if (lambda (e) (and (listp e) (eq (first e) :plain))) *report*)))
       (when oh
         (format out "~%## Overhead (C7)~%~%")
@@ -497,31 +369,23 @@ RELEASE. Returns the thread once the pin is counted."
 
 (defun run-criteria (&key (runs (default-runs)))
   "Run every criterion in order, write artifacts/criteria-report.md, and
-return T when all pass. The order matters: the checkpoints run on their own
-log first, the pristine signature is captured before the flagship patch,
-and the full-log checks run last."
+return T when all pass. Each criterion is a measurement that moves with chance
+or with the machine; the claims that don't are tests in splice-orders/tests
+and splice/integration-tests."
   (let ((*runs* runs)
         (*failures* '())
         (*report* '())
         (*batches* '())
         (*big-log* (fresh-scratch-log "splice-criteria.log")))
     (format t "~%=== splice criteria runner (~a runs per class) ===~%" *runs*)
-    (check-reconstruction-checkpoints)
-    (check-resume-after-hard-trigger)
-    (check-runtime-contract-routing)
-    (check-promotion-waits-for-drain)
     (splice:open-audit-log *big-log*)
     (orders:reset-workload)
-    (let ((pristine (workload-signature 777 300)))
-      (check-flagship)
-      (check-post-rollback-workload pristine))
     (format t "~%--- C2/C6: ~a-run batches per class~%" *runs*)
     (check-clean-batch)
     (check-fault-batches)
-    (check-coherence)
     (check-overhead)
     (splice:close-audit-log)
-    (check-audit-log)
+    (check-operating-characteristics)
     (write-report)
     (format t "~%=== ~:[~a FAILURES~;all criteria passed~]; report: artifacts/criteria-report.md ===~%"
             (null *failures*) (length *failures*))

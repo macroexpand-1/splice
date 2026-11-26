@@ -7,7 +7,7 @@
             (:constructor make-orders-workload (port orders)))
   (port nil :read-only t)
   (orders nil :read-only t)
-  ;; mutable slots
+  ;; mutable
   (stopping nil)
   (worker nil))
 
@@ -38,8 +38,10 @@ the pre-existing orders that must survive the migration. Returns the orders"
 
 (defun run-member-workload (workload cluster-member ps)
   "Drive orders until PS leaves canary stages or WORKLOAD is stopping,
-sending the conductor CLUSTER-MEMBER's health every 200 tasks"
+sending the conductor CLUSTER-MEMBER's health every 200 tasks. Fault draws
+come from a seeded RNG of this thread's own, as in a local session"
   (let ((rng (make-rng (+ 1000 (orders-workload-port workload))))
+        (*fault-rng* (make-rng (+ 2000 (orders-workload-port workload))))
         (orders (orders-workload-orders workload)))
     (loop for i from 1
           until (or (orders-workload-stopping workload)

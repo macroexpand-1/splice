@@ -184,7 +184,9 @@
                (is (eq :consistent (d:check-recording snapshots path)))
                (is (eq :inconsistent (d:check-recording (with-one-llr-changed snapshots) path)))
                (is (eq :no-points (d:check-recording (without-sprt-points snapshots) path)))
-               (is (eq :broken-log (d:check-recording snapshots (d:tamper-copy path))))))
+               (is (eq :broken-log
+                       (d:call-with-tampered-copy
+                        path (lambda (copy) (d:check-recording snapshots copy)))))))
         (setf splice::*audit-sprt-steps* steps)
         (uiop:delete-file-if-exists recording)))))
 

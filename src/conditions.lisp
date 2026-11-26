@@ -27,7 +27,7 @@
 
 (define-condition canary-verdict (splice-condition)
   ((stream-kind :initarg :stream-kind :reader canary-verdict-stream)
-   (direction :initarg :direction :reader canary-verdict-direction) ; :accept / :reject
+   (direction :initarg :direction :reader canary-verdict-direction) ; :pass / :reject
    (n :initarg :n :reader canary-verdict-n)
    (llr :initarg :llr :reader canary-verdict-llr))
   (:report (lambda (c stream)

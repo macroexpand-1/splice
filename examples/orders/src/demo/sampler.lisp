@@ -88,11 +88,12 @@ in between shows as one frame of :PENDING never as a wrong :CURRENT."
         :phase (class-phase class-name)))
 
 (defun read-sprt-bounds (ps)
-  "Reject and accept bounds and the min-n floor. Both streams share them."
-  (let ((sprt (splice::patch-set-sprt-error ps)))
-    (list :upper (float (splice:sprt-upper sprt) 1.0)
-          :lower (float (splice:sprt-lower sprt) 1.0)
-          :min-n (splice::sprt-min-n sprt))))
+  "The reject line and the stage budget. Both signals share them."
+  (let ((stage (splice::patch-set-stage ps)))
+    (list :upper (float (splice::mixture-test-log-reject
+                         (splice::canary-stage-error-test stage))
+                        1.0)
+          :budget (splice::canary-stage-budget stage))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Threads
@@ -252,9 +253,9 @@ Things like a registry race or a class mid-redefinition"
 since the next session may already be resetting the workload"
   (let* ((previous (snapshot-for-session snapshot (orders:live-session-started session)))
          (next (fold-frame previous session faults)))
-    (cond ((stringp next) (values snapshot (add-fault next faults)))
-          ((eq session orders:*live-session*) (values next (call-sinks sinks next)))
-          (t (values snapshot faults)))))
+    (cond ((not (eq session orders:*live-session*)) (values snapshot faults))
+          ((stringp next) (values snapshot (add-fault next faults)))
+          (t (values next (call-sinks sinks next))))))
 
 (defun sample-once (snapshot faults sinks)
   "Returns SNAPSHOT to fold from next time and the faults the next snapshot reports.

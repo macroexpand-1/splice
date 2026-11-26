@@ -18,8 +18,8 @@
    #:with-task #:*task-id* #:current-route #:task-route-for
 
    ;; SPRT
-   #:make-sprt #:sprt-observe #:sprt-verdict #:sprt-llr #:sprt-n
-   #:sprt-upper #:sprt-lower
+   #:make-mixture-test #:mixture-observe #:mixture-verdict #:mixture-log-odds
+   #:stage-budget
 
    ;; outcome reporting (harness -> evaluator)
    #:report-outcome
@@ -36,7 +36,8 @@
    ;; conditions & restarts
    #:splice-condition #:patch-vetoed #:canary-anomaly #:canary-verdict
    #:migration-failure #:rollback-initiated #:rollback-failure
-   #:illegal-transition #:operator-decision #:unknown-patch-set
+   #:illegal-transition #:illegal-transition-from #:illegal-transition-requested
+   #:operator-decision #:unknown-patch-set
    #:fallback-to-old #:roll-back-patch #:freeze-patch #:promote-anyway
    #:let-splice-decide #:with-operator-decisions
 

@@ -29,16 +29,24 @@ threads from the rest. orders-straggler is reserved for a held :old task.")
   (threads nil :read-only t)
   (started nil :read-only t)
   (audit-start-seq nil :read-only t)
-  (pacer nil :read-only t))
+  (pacer nil :read-only t)
+  (max-tasks nil :read-only t)       ; the cap on tasks the session runs
+  (touch-every nil :read-only t))    ; every this many tasks touches a pre-existing order
 
 (defvar *live-session* nil
   "The session RUN-CANARY-SESSION is running or last ran (for other threasd)
 NIL from the start of a session until its install succeeds")
 
 (defstruct session-result
-  final-state transitions tasks-run veto-p
-  detection-observations reversal-report pre-existing-snapshot
-  post-rollback-comparison wallclock-ms)
+  (final-state nil :read-only t)
+  (transitions nil :read-only t)
+  (tasks-run nil :read-only t)
+  (veto-p nil :read-only t)
+  (detection-observations nil :read-only t)
+  (reversal-report nil :read-only t)
+  (pre-existing-snapshot nil :read-only t)
+  (post-rollback-comparison nil :read-only t)
+  (wallclock-ms nil :read-only t))
 
 ;;; ---------------------------------------------------------------------
 ;;; Hooks for observers
@@ -115,27 +123,55 @@ its work. PS must be in the canary stage below 100. Returns the thread"
         :status (order-status order)
         :discount-code (order-discount-code order)))
 
+(defun random-discount-code (rng)
+  "\"TEN\", \"VIP\" or NIL, drawn from RNG"
+  (case (mod (rng-next rng) 5)
+    (0 "TEN")
+    (1 "VIP")
+    (t nil)))
+
+(defun random-order (rng id)
+  "A fresh order with ID, its count, price and discount code drawn from RNG"
+  (make-instance 'order
+                 :id id
+                 :item-count (rng-range rng 1 9)
+                 :unit-price (/ (rng-range rng 100 9999) 100.0)
+                 :discount-code (random-discount-code rng)))
+
+(defun priced-order (rng id)
+  "A random order with ID, priced the pre-patch way"
+  (let ((order (random-order rng id)))
+    (price-order order)
+    order))
+
+(defun corrupt-order (order)
+  "Mark ORDER corrupted, so forward migration fails on it under :migration"
+  (setf (order-float-total order) -5.0
+        (order-status order) :corrupted))
+
 (defun make-pre-existing-orders (rng count &key corrupted)
   "Orders that predate the patch, for migration to move and rollback to
 restore. CORRUPTED orders fail forward migration under :migration."
   (let ((orders (loop for i from 1 to count
-                      collect (let ((o (make-instance 'order
-                                                      :id i
-                                                      :item-count (rng-range rng 1 9)
-                                                      :unit-price (/ (rng-range rng 100 9999) 100.0)
-                                                      :discount-code (case (mod (rng-next rng) 5)
-                                                                       (0 "TEN") (1 "VIP")
-                                                                       (t nil)))))
-                                (price-order o)
-                                o))))
+                      collect (priced-order rng i))))
     (dotimes (i (or corrupted 0))
-      (let ((o (nth (* 3 i) orders)))
-        (setf (order-float-total o) -5.0 (order-status o) :corrupted)))
+      (corrupt-order (nth (* 3 i) orders)))
     orders))
 
-(defun run-canary-session (&key (fault nil) (seed 42) (max-tasks 20000)
+(defun budgeted-task-cap (ramp &key alpha beta min-effect)
+  "Tasks a healthy session needs to pass every stage of RAMP, with half
+again for slack."
+  (ceiling (* 3/2 (reduce #'+ ramp
+                          :key (lambda (fraction)
+                                 (/ (splice:stage-budget fraction :alpha alpha
+                                                                  :stage-count (length ramp)
+                                                                  :beta beta
+                                                                  :min-effect min-effect)
+                                    (/ fraction 100)))))))
+
+(defun run-canary-session (&key (fault nil) (seed 42) (max-tasks :budgeted)
                              (ramp '(5 25 100)) (alpha 0.01d0) (beta 0.05d0)
-                             (min-n 50) (max-n 2000)
+                             (min-effect 0.3d0) (stage-limit 40000)
                              (pre-existing 40) (threads 1)
                              (touch-pre-existing-every 11)
                              paired-fallback quiet
@@ -143,7 +179,8 @@ restore. CORRUPTED orders fail forward migration under :migration."
   "Run one patch lifecycle under synthetic load; return a SESSION-RESULT.
 Expects an open audit log. PACE, when given, is called with each stage index
 and blocks until that stage may run. SETTLE-TIMEOUT is how long to wait for a
-terminal state once the workers stop."
+terminal state once the workers stop. MAX-TASKS :BUDGETED sizes the cap
+from the stage budgets with BUDGETED-TASK-CAP."
   ;; withdraw the last session before the workload it describes is reset
   (setf *live-session* nil)
   (reset-workload)
@@ -155,88 +192,162 @@ terminal state once the workers stop."
                   :corrupted (when (eq fault :migration) 3)))
          (pre-snapshot (mapcar #'snapshot-order orders))
          (start (get-internal-real-time))
-         (audit-start-seq (if splice:*audit-log*
-                              (splice::audit-log-seq splice:*audit-log*)
-                              0))
+         (audit-start-seq (current-audit-seq))
          (ps (register-currency-patch-set
-              :ramp ramp :alpha alpha :beta beta :min-n min-n :max-n max-n
-              :paired-fallback paired-fallback))
-         (pacer (make-pacer :pace pace))
-         (tasks-run (list 0))
-         (stop (list nil)))
+              :ramp ramp :alpha alpha :beta beta
+              :min-effect min-effect :stage-limit stage-limit
+              :paired-fallback paired-fallback)))
     (handler-case (splice:install ps)
       (splice:patch-vetoed (e)
-        (return-from run-canary-session
-          (make-session-result :final-state :vetoed :veto-p t
-                               :transitions (princ-to-string e)))))
-    (publish-session :patch-set ps :orders orders :seed seed :fault fault
+        (return-from run-canary-session (vetoed-result e))))
+    (let* ((session (publish-session
+                     :patch-set ps :orders orders :seed seed :fault fault
                      :threads threads :started (get-internal-real-time)
-                     :audit-start-seq audit-start-seq :pacer pacer)
-    (flet ((run-one (i task-rng)
-             (await-pace pacer ps)
-             ;; think time keeps load tracking the ramp when canary is slow
-             (when (> threads 1) (sleep 0.0002))
-             (when (fault-active-p :load-correlated)
-               (fault-window-note *fault* :total))
-             (splice:with-task (:id i :swallow-errors t)
-               (let ((o (if (zerop (mod i touch-pre-existing-every))
-                            ;; touch old orders to drive forward migration
-                            (nth (mod (rng-next task-rng) (length orders)) orders)
-                            (make-instance 'order
-                                           :id (+ 1000 i)
-                                           :item-count (rng-range task-rng 1 9)
-                                           :unit-price (/ (rng-range task-rng 100 9999) 100.0)
-                                           :discount-code (case (mod (rng-next task-rng) 5)
-                                                            (0 "TEN") (1 "VIP") (t nil))))))
-                 (process-order o))))
-           (terminal-p ()
-             ;; once decided, stop load so completion isn't mutex-starved
-             (member (splice:patch-set-state ps)
-                     '(:promoted :rolled-back :frozen :vetoed
-                       :promoting :swapping :rolling-back :restoring))))
-      (if (> threads 1)
-          ;; threads don't inherit dynamic bindings: rebind the shared
-          ;; fault and give each worker its own PRNG
-          (let* ((fault-obj *fault*)
-                 (workers
-                   (loop for w from 0 below threads
-                         collect (let ((wrng (make-rng (+ seed 100 w))))
-                                   (sb-thread:make-thread
-                                    (lambda ()
-                                      (let ((*fault* fault-obj)
-                                            (*fault-rng* wrng))
-                                        (loop for i = (sb-ext:atomic-incf (car tasks-run))
-                                              until (or (car stop) (> i max-tasks))
-                                              do (run-one i wrng)
-                                                 (when (terminal-p)
-                                                   (setf (car stop) t)))))
-                                    :name (format nil "~a~a" *worker-prefix* w))))))
-            (mapc #'sb-thread:join-thread workers))
-          (loop for i from 1 to max-tasks
-                until (terminal-p)
-                do (run-one i rng) (setf (car tasks-run) i))))
-    (splice:wait-for-state ps '(:promoted :rolled-back :frozen) :timeout settle-timeout)
-    (let ((result
-            (make-session-result
-             :final-state (splice:patch-set-state ps)
-             :transitions (splice:patch-set-lifecycle-history ps)
-             :tasks-run (car tasks-run)
-             :detection-observations (detection-observations-from-audit audit-start-seq)
-             :reversal-report (splice:reverse-migration-report 'currency-migration)
-             :pre-existing-snapshot pre-snapshot
-             :post-rollback-comparison
-             (when (eq (splice:patch-set-state ps) :rolled-back)
-               (compare-rollback-exactness orders pre-snapshot ps))
-             :wallclock-ms (round (* 1000 (- (get-internal-real-time) start))
-                                  internal-time-units-per-second))))
-      (unless quiet
-        (format t "~&  [~a seed=~a] ~a after ~a tasks (~ams)~a~%"
-                (or fault :clean) seed (session-result-final-state result)
-                (session-result-tasks-run result)
-                (session-result-wallclock-ms result)
-                (let ((n (session-result-detection-observations result)))
-                  (if (integerp n) (format nil " detection-n=~a" n) ""))))
-      result)))
+                     :audit-start-seq audit-start-seq :pacer (make-pacer :pace pace)
+                     :max-tasks (session-task-cap max-tasks ramp alpha beta min-effect)
+                     :touch-every touch-pre-existing-every))
+           (tasks-run (run-session-load session rng)))
+      (splice:wait-for-state ps '(:promoted :rolled-back :frozen) :timeout settle-timeout)
+      (let ((result (collect-session-result session tasks-run pre-snapshot start)))
+        (unless quiet
+          (print-session-line fault seed result))
+        result))))
+
+(defun current-audit-seq ()
+  "The open audit log's sequence number, or 0 with no log open"
+  (if splice:*audit-log*
+      (splice::audit-log-seq splice:*audit-log*)
+      0))
+
+(defun session-task-cap (max-tasks ramp alpha beta min-effect)
+  "MAX-TASKS, or the cap BUDGETED-TASK-CAP gives RAMP when it is :BUDGETED"
+  (if (eq max-tasks :budgeted)
+      (budgeted-task-cap ramp :alpha alpha :beta beta :min-effect min-effect)
+      max-tasks))
+
+(defun vetoed-result (patch-vetoed)
+  "The SESSION-RESULT for a session whose install was vetoed"
+  (make-session-result :final-state :vetoed :veto-p t
+                       :transitions (princ-to-string patch-vetoed)))
+
+;;; ---------------------------------------------------------------------
+;;; Session load
+;;; The tasks a session runs, on this thread or on worker threads.
+
+(defun session-decided-p (session)
+  "True once SESSION's patch set has a verdict, so load can stop and
+completion isn't mutex-starved"
+  (member (splice:patch-set-state (live-session-patch-set session))
+          '(:promoted :rolled-back :frozen :vetoed
+            :promoting :swapping :rolling-back :restoring)))
+
+(defun session-order (session i rng)
+  "The order task I of SESSION processes: a pre-existing one every
+touch-every tasks, to drive forward migration, otherwise a fresh one"
+  (let ((orders (live-session-orders session)))
+    (if (zerop (mod i (live-session-touch-every session)))
+        (nth (mod (rng-next rng) (length orders)) orders)
+        (random-order rng (+ 1000 i)))))
+
+(defun run-session-task (session i rng)
+  "Run task I of SESSION once the presenter lets its stage run"
+  (await-pace (live-session-pacer session) (live-session-patch-set session))
+  ;; think time keeps load tracking the ramp when canary is slow
+  (when (> (live-session-threads session) 1)
+    (sleep 0.0002))
+  (when (fault-active-p :load-correlated)
+    (fault-window-note *fault* :total))
+  (splice:with-task (:id i :swallow-errors t)
+    (process-order (session-order session i rng))))
+
+(defun run-session-load (session rng)
+  "Run SESSION's tasks until its patch set has a verdict or the task cap is
+reached. Returns the number of tasks run"
+  (let ((tasks-run (list 0)))
+    (if (> (live-session-threads session) 1)
+        (run-threaded-load session tasks-run)
+        (run-serial-load session rng tasks-run))
+    (car tasks-run)))
+
+(defun run-serial-load (session rng tasks-run)
+  "Run SESSION's tasks on this thread, counting them in TASKS-RUN"
+  (loop for i from 1 to (live-session-max-tasks session)
+        until (session-decided-p session)
+        do (run-session-task session i rng)
+           (setf (car tasks-run) i)))
+
+(defun run-threaded-load (session tasks-run)
+  "Run SESSION's tasks on its worker threads and wait for them all"
+  (let ((stop (list nil)))
+    (mapc #'sb-thread:join-thread
+          (loop for w from 0 below (live-session-threads session)
+                collect (start-session-worker session w tasks-run stop)))))
+
+(defun start-session-worker (session w tasks-run stop)
+  "Start worker W of SESSION. Returns the thread"
+  ;; threads don't inherit dynamic bindings: rebind the shared
+  ;; fault and give each worker its own PRNG
+  (let ((fault *fault*)
+        (rng (make-rng (+ (live-session-seed session) 100 w))))
+    (sb-thread:make-thread
+     (lambda ()
+       (let ((*fault* fault)
+             (*fault-rng* rng))
+         (work-session-tasks session rng tasks-run stop)))
+     :name (format nil "~a~a" *worker-prefix* w))))
+
+(defun work-session-tasks (session rng tasks-run stop)
+  "Take task numbers from TASKS-RUN and run them until STOP is set or the
+cap is passed. The worker that sees a verdict sets STOP"
+  (loop for i = (sb-ext:atomic-incf (car tasks-run))
+        until (or (car stop) (> i (live-session-max-tasks session)))
+        do (run-session-task session i rng)
+           (when (session-decided-p session)
+             (setf (car stop) t))))
+
+;;; ---------------------------------------------------------------------
+;;; Session result
+
+(defun collect-session-result (session tasks-run pre-snapshot start)
+  "The SESSION-RESULT for SESSION once its patch set has settled. START is
+when the session began, in internal real time"
+  (let ((ps (live-session-patch-set session)))
+    (make-session-result
+     :final-state (splice:patch-set-state ps)
+     :transitions (splice:patch-set-lifecycle-history ps)
+     :tasks-run tasks-run
+     :detection-observations (detection-observations-from-audit
+                              (live-session-audit-start-seq session))
+     :reversal-report (splice:reverse-migration-report 'currency-migration)
+     :pre-existing-snapshot pre-snapshot
+     :post-rollback-comparison (rollback-comparison session pre-snapshot)
+     :wallclock-ms (elapsed-ms start))))
+
+(defun rollback-comparison (session pre-snapshot)
+  "How SESSION's orders compare with PRE-SNAPSHOT after a rollback, or NIL"
+  (let ((ps (live-session-patch-set session)))
+    (when (eq (splice:patch-set-state ps) :rolled-back)
+      (compare-rollback-exactness (live-session-orders session) pre-snapshot ps))))
+
+(defun elapsed-ms (start)
+  "Milliseconds since START, in internal real time"
+  (round (* 1000 (- (get-internal-real-time) start))
+         internal-time-units-per-second))
+
+(defun print-session-line (fault seed result)
+  "Print RESULT's one-line summary for a session with FAULT and SEED"
+  (format t "~&  [~a seed=~a] ~a after ~a tasks (~ams)~a~%"
+          (or fault :clean) seed (session-result-final-state result)
+          (session-result-tasks-run result)
+          (session-result-wallclock-ms result)
+          (detection-note result)))
+
+(defun detection-note (result)
+  "\" detection-n=N\" when RESULT has a detection count, otherwise \"\""
+  (let ((n (session-result-detection-observations result)))
+    (if (integerp n)
+        (format nil " detection-n=~a" n)
+        "")))
 
 ;;; ---------------------------------------------------------------------
 ;;; Evidence
@@ -246,7 +357,7 @@ terminal state once the workers stop."
 after AFTER-SEQ. Returns the count, :NO-LOG or :NO-SPRT-REJECT"
   (if splice:*audit-log*
       (let ((*package* (find-package :splice)))
-        (loop for line in (splice::audit-log-lines splice:*audit-log*)
+        (loop for line in (copy-audit-lines splice:*audit-log*)
               for entry = (ignore-errors (read-from-string line))
               when (and entry (<= (getf entry :seq 0) after-seq))
                 do (return :no-sprt-reject) ; lines are newest-first; past the session
@@ -256,6 +367,11 @@ after AFTER-SEQ. Returns the count, :NO-LOG or :NO-SPRT-REJECT"
                        (return (getf (second trigger) :n))))
               finally (return :no-sprt-reject)))
       :no-log))
+
+(defun copy-audit-lines (log)
+  "LOG's in-memory lines, newest first, copied under its lock because AUDIT trims them in place"
+  (sb-thread:with-mutex ((splice::audit-log-lock log))
+    (copy-list (splice::audit-log-lines log))))
 
 (defun compare-rollback-exactness (orders pre-snapshot ps)
   "Check rollback exactness: fdefinitions EQ the originals, the class shape

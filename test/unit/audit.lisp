@@ -549,3 +549,34 @@
            (reasons (verify-while-writing log path)))
       (is (every (lambda (reason) (eq :intact reason)) reasons)
           "~s" (remove-duplicates reasons)))))
+
+(defun append-to-file (path string)
+  (with-open-file (out path :direction :output :if-exists :append)
+    (write-string string out)))
+
+(defun overwrite-file-start (path string)
+  (with-open-file (out path :direction :output :if-exists :overwrite)
+    (write-string string out)))
+
+(test the-open-log-reads-only-what-it-has-synced
+  "A line half appended and a checkpoint half overwritten, as a writer on
+another thread leaves them mid-write, don't count against the open log. Once
+it is closed they do"
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:audit :probe :n 2)
+    (append-to-file path "(:seq 3 :ts \"20")
+    (overwrite-file-start (splice::checkpoint-path path) "xxxx")
+    (is (eq :intact (nth-value 3 (splice:verify-audit-chain path))))
+    (is (= 2 (length (log-entries path))))
+    (splice:close-audit-log)
+    (is (eq :torn-tail (nth-value 3 (splice:verify-audit-chain path))))))
+
+(test the-open-log-shows-lines-cut-from-its-end
+  (with-temp-log-path (path)
+    (splice:open-audit-log path)
+    (splice:audit :probe :n 1)
+    (splice:audit :probe :n 2)
+    (splice::truncate-file path (1+ (length (first (log-lines path)))))
+    (is (eq :truncated (nth-value 3 (splice:verify-audit-chain path))))))

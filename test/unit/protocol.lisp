@@ -24,15 +24,14 @@
 (defun probe-spec (&key (ramp '(100))
                      (new-text "(lambda (x) (error \"canary broke on ~a\" x))"))
   "One-function spec replacing PROTOCOL-PROBE in this package. By default
-the new code always fails, so the error SPRT rejects at its floor of 5"
+the new code always fails, so the error test rejects within a few tasks"
   (list :name "PROTOCOL-PROBE-SET" :package "SPLICE-TESTS"
         :description "protocol probe"
         :functions (list (list "PROTOCOL-PROBE" new-text))
         :classes '()
         :contracts '()
         :ramp ramp
-        :min-n 5
-        :max-n 2000))
+        :stage-limit 2000))
 
 (defun shipped-cluster (&rest ids)
   "A cluster of IDS that has shipped the probe spec and the ship's effects"
@@ -100,7 +99,7 @@ the new code always fails, so the error SPRT rejects at its floor of 5"
 
 (test a-tampered-spec-is-refused-before-anything-is-read
   (let ((spec (splice/cluster:spec-with-hash (probe-spec))))
-    (setf (getf spec :min-n) 1)
+    (setf (getf spec :stage-limit) 1)
     (unwind-protect
          (progn
            (signals error (splice/cluster:build-patch-set spec))
@@ -144,8 +143,9 @@ the new code always fails, so the error SPRT rejects at its floor of 5"
 (test the-pooled-llr-rolls-back-once
   (multiple-value-bind (cluster effects)
       (stepped (running-cluster :a :b)
-               '(:a (:health :state :canary-5 :fraction 5 :n 200 :llr-milli 2300))
-               '(:b (:health :state :canary-5 :fraction 5 :n 200 :llr-milli 2300))
+               ;; 2.7 + 2.7 crosses log 200 (5.298); A's later 3.0 must send nothing more
+               '(:a (:health :state :canary-5 :fraction 5 :n 200 :llr-milli 2700))
+               '(:b (:health :state :canary-5 :fraction 5 :n 200 :llr-milli 2700))
                '(:a (:health :state :canary-5 :fraction 5 :n 400 :llr-milli 3000)))
     (is (eq :running (splice/cluster::cluster-phase cluster)))
     (is (equal '((:a (:rollback)) (:b (:rollback))) (sends effects)))

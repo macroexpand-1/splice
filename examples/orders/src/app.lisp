@@ -15,18 +15,21 @@
 ;;; ---------------------------------------------------------------------
 ;;; Globals and the structs they hold
 
-(defstruct (rng (:constructor %make-rng)) (state 88172645463325252))
+(defstruct (rng (:constructor %make-rng))
+  ;; mutable
+  (state 88172645463325252))
 
 (defstruct fault
-  kind
-  (latent-code "VIP")           ; :latent trips on this discount code
-  (share-threshold 0.15)        ; :load-correlated trips above this share
-  (window-min-total 100)        ; ... once the window has enough traffic
-  (onset-calls 250)             ; :delayed-onset healthy for this many calls
-  (onset-error-rate 0.30)
-  (slow-ms 3.0)                 ; :slow-burn extra latency
-  (call-count (list 0))         ; shared counter (cons cell for atomicity)
-  (window (list 0 0 0)))        ; (start-tick total-calls canary-calls)
+  (kind nil :read-only t)
+  (latent-code "VIP" :read-only t)          ; :latent trips on this discount code
+  (share-threshold 0.15 :read-only t)       ; :load-correlated trips above this share
+  (window-min-total 100 :read-only t)       ; ... once the window has enough traffic
+  (onset-calls 250 :read-only t)            ; :delayed-onset healthy for this many calls
+  (onset-error-rate 0.30 :read-only t)
+  (slow-ms 3.0 :read-only t)                ; :slow-burn extra latency
+  (call-count (list 0) :read-only t)        ; shared counter (cons cell for atomicity)
+  ;; mutable
+  (window (list 0 0 0)))                    ; (start-tick total-calls canary-calls)
 
 (defvar *fault* nil "The active injected fault, or NIL for a clean patch.")
 
