@@ -147,7 +147,7 @@ sbcl --non-interactive --eval '(require :asdf)' \
      --eval '(asdf:test-system "splice")'
 ```
 
-Run every check (unit, integration, cluster, and the demo) the way CI does:
+Run every check (unit, integration, cluster, and the demo) the way CI does, which also compiles the criteria without running them:
 
 ```sh
 sbcl --non-interactive --load test/check.lisp
@@ -157,8 +157,10 @@ Each check runs in a fresh SBCL with a deadline, and the run stops at the first 
 
 The criteria are a report, not a check.
 They measure detection rates over 100 sessions per fault class and the shim's cost per call, so their numbers move with chance and with the machine.
-CI runs them after the checks and uploads `examples/orders/artifacts/criteria-report.md` without failing on a missed criterion.
-Run them locally, in about 15 minutes, with:
+A full run takes about 35 minutes on a CI runner, so they stay out of the CI on each push.
+The `criteria` workflow runs them on `main` every Monday and on demand (`gh workflow run criteria --ref <branch>`).
+It fails on a missed criterion and uploads `examples/orders/artifacts/criteria-report.md` either way.
+Run them locally, in about 15 minutes on an Apple-silicon Mac, with:
 
 ```sh
 sbcl --non-interactive --eval '(require :asdf)' \

@@ -1,8 +1,9 @@
 ;;;; criteria.lisp: measures the success criteria that move with chance or
 ;;;; with the machine (detection rates, false rejects, operating
 ;;;; characteristics, shim overhead) and writes artifacts/criteria-report.md
-;;;; (under examples/orders/) with the numbers. CI uploads the report and
-;;;; doesn't gate on it. From the repository root:
+;;;; (under examples/orders/) with the numbers. The criteria workflow
+;;;; (.github/workflows/criteria.yml) runs this weekly and on demand, fails on
+;;;; a missed criterion, and uploads the report. From the repository root:
 ;;;;
 ;;;;   sbcl --non-interactive --eval '(require :asdf)' \
 ;;;;        --eval '(asdf:load-asd (truename "splice.asd"))' \

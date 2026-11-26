@@ -8,8 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The criteria run weekly and on demand in criteria.yml, not here.
 jobs:
-  criteria:
+  checks:
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +35,7 @@ jobs:
           - name: sbcl-current-arch
             container: archlinux:latest
             install: pacman -Syu --noconfirm sbcl
-    name: criteria (${{ matrix.name }})
+    name: checks (${{ matrix.name }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.container }}
     timeout-minutes: 35
@@ -72,25 +73,3 @@ jobs:
       # the same file, so the list lives there.
       - name: Checks
         run: sbcl --non-interactive --load test/check.lisp
-
-      # The criteria measure detection rates and the shim's cost, which move
-      # with chance and with the runner, so a missed criterion is recorded in
-      # the report rather than failing the run. RUN-CRITERIA's return value is
-      # ignored; an error inside it still exits nonzero and fails the step.
-      - name: Criteria report
-        timeout-minutes: 25
-        run: >-
-          sbcl --non-interactive
-          --eval '(require :asdf)'
-          --eval '(asdf:load-asd (truename "splice.asd"))'
-          --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))'
-          --eval '(asdf:load-system "splice-orders/criteria")'
-          --eval '(uiop:symbol-call :splice-orders/criteria :run-criteria)'
-
-      - name: Upload criteria report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: criteria-report-${{ matrix.name }}
-          path: examples/orders/artifacts/criteria-report.md
-          if-no-files-found: ignore

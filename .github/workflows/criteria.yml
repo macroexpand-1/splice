@@ -1,0 +1,62 @@
+name: criteria
+
+# The criteria measure detection rates and the shim's cost over 100 sessions
+# per fault class, which takes about 35 minutes on a runner, so they run
+# weekly on main and on demand rather than on every push:
+#
+#   gh workflow run criteria --ref <branch>
+#
+# A missed criterion fails the run (TEST-OP signals an error), so a scheduled
+# miss sends a failure email. The report is uploaded either way.
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays, 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  criteria:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same two SBCLs as ci.yml; see the comments there.
+        include:
+          - name: sbcl-2.6.9-ubuntu-24.04
+            container: ""
+            install: |
+              cd /tmp
+              curl -fsSLO https://downloads.sourceforge.net/project/sbcl/sbcl/2.6.9/sbcl-2.6.9-x86-64-linux-binary.tar.bz2
+              echo "39fac28407405841003e4c2abfbe0d96abd93b7701e8b61cdd35e713943b46d6  sbcl-2.6.9-x86-64-linux-binary.tar.bz2" | sha256sum -c
+              tar -xjf sbcl-2.6.9-x86-64-linux-binary.tar.bz2
+              cd sbcl-2.6.9-x86-64-linux
+              sudo sh install.sh
+          - name: sbcl-current-arch
+            container: archlinux:latest
+            install: pacman -Syu --noconfirm sbcl
+    name: criteria (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install SBCL
+        run: ${{ matrix.install }}
+
+      - name: SBCL version
+        run: sbcl --version
+
+      - name: Criteria
+        run: >-
+          sbcl --non-interactive
+          --eval '(require :asdf)'
+          --eval '(asdf:load-asd (truename "splice.asd"))'
+          --eval '(asdf:load-asd (truename "examples/orders/splice-orders.asd"))'
+          --eval '(asdf:test-system "splice-orders/criteria")'
+
+      - name: Upload criteria report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: criteria-report-${{ matrix.name }}
+          path: examples/orders/artifacts/criteria-report.md
+          if-no-files-found: ignore

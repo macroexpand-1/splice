@@ -11,8 +11,10 @@
 ;;;;
 ;;;; The criteria are not a check. They measure detection rates over 100
 ;;;; sessions per fault class and the shim's cost in nanoseconds, so their
-;;;; numbers move with chance and with the machine. CI runs them in a step of
-;;;; their own and uploads the report without gating on it.
+;;;; numbers move with chance and with the machine, and a full run takes
+;;;; about 35 minutes on a CI runner. The criteria workflow
+;;;; (.github/workflows/criteria.yml) runs them weekly and on demand. Here
+;;;; they are only loaded, so a change that breaks their compile fails now.
 ;;;;
 ;;;; Every check has a deadline of 10 minutes. A check still running at its
 ;;;; deadline is killed and reported as timed out, so a hang fails the run
@@ -73,6 +75,8 @@ OPERATION, a string such as \"asdf:test-system\", on SYSTEM-NAME"
         ;; Checks that the transport compiles, and that the protocol loads
         ;; without the orders example. No test opens a socket yet.
         (load-check "splice/cluster-tcp")
+        ;; Compiles the criteria without running them; see the header.
+        (load-check "splice-orders/criteria")
         (test-check "splice/integration-tests")
         (test-check "splice-orders/tests")
         (test-check "splice-orders/demo-probe")
