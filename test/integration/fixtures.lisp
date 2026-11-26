@@ -19,7 +19,17 @@
 ;;; Each test installs a set over LIFECYCLE-PROBE and retires it
 ;;; afterwards, which puts the original function back.
 
-(defun lifecycle-probe (x) x)
+;;; An identity probe takes one tick of a 24 MHz clock. At that size the
+;;; control p95 is the median tick, and the shim's own overhead on the new
+;;; route crosses it often enough that a healthy set sometimes rejects.
+;;; Summing X a thousand times gives a task microseconds of work, well above
+;;; the shim. Both routes call it, so the control and canary do the same work.
+
+(defun busy-work (x)
+  "X, an integer, computed by summing it a thousand times"
+  (/ (loop repeat 1000 sum x) 1000))
+
+(defun lifecycle-probe (x) (busy-work x))
 
 (defun failing-probe-set (name)
   "Every task canaries and every canary fails, so the one-sample error test
@@ -33,7 +43,7 @@ rejects within a few observations."
 (defun healthy-probe-set (name)
   "Two stages, so passing the first enters the second rather than starting
 a promotion thread. A 4x smallest effect keeps the budget near 360."
-  (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) x))))
+  (let ((ps (fn-patch-set name 'lifecycle-probe (lambda (x) (busy-work x)))))
     (setf (splice::patch-set-ramp ps) '(50 100)
           (splice::patch-set-min-effect ps) 3d0
           (splice::patch-set-runtime-contract-interval ps) 0)
