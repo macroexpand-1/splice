@@ -161,6 +161,7 @@ or one on a set that isn't registered, is refused with ILLEGAL-TRANSITION."
   (let ((fraction (nth index (patch-set-ramp ps))))
     (setf (patch-set-stage-index ps) index
           (patch-set-current-fraction ps) fraction
+
           (patch-set-stage ps) (fresh-stage ps fraction))
     (transition ps (stage-keyword fraction)
                 :fraction fraction
