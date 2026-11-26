@@ -25,6 +25,8 @@
 (defvar *report* '())
 (defvar *batches* '())
 (defvar *big-log* nil "The log every section after the checkpoints shares.")
+(defvar *oc-rows* '() "One row per traffic shape the C8 run measured, newest first")
+(defparameter *oc-fraction* 25 "The stage every C8 run canaries at")
 
 ;;; ---------------------------------------------------------------------
 ;;; Helpers
@@ -499,6 +501,136 @@ so the check fails without promoting"
              (and (not ok) break-seq) break-seq))))
 
 ;;; ---------------------------------------------------------------------
+;;; C8: operating characteristics
+;;; The live evaluator fed synthetic outcome streams through REPORT-OUTCOME,
+;;; routed by the production draw. One stage per run, since the budget is a
+;;; per-stage promise; a one-stage ramp gives that stage the whole alpha.
+
+(defstruct (traffic (:copier nil))
+  (label "" :read-only t)
+  (error-rate 0.01d0 :read-only t)
+  (error-ratio 1d0 :read-only t)
+  (latency-factor 1d0 :read-only t)
+  (burst-period 0 :read-only t)
+  (burst-length 0 :read-only t)
+  (burst-rate 0d0 :read-only t)
+  (burst-arms :both :read-only t)
+  (harmful nil :read-only t))
+
+(defun oc-traffic-shapes ()
+  (list (make-traffic :label "Healthy")
+        (make-traffic :label "Healthy, shared bursts"
+                      :burst-period 1000 :burst-length 100 :burst-rate 0.1d0)
+        (make-traffic :label "Latency 1.1x" :latency-factor 1.1d0 :harmful t)
+        (make-traffic :label "Latency 1.2x" :latency-factor 1.2d0 :harmful t)
+        (make-traffic :label "Latency 1.3x" :latency-factor 1.3d0 :harmful t)
+        (make-traffic :label "Latency 1.5x" :latency-factor 1.5d0 :harmful t)
+        (make-traffic :label "Latency 2x" :latency-factor 2d0 :harmful t)
+        (make-traffic :label "Errors 1.3x" :error-ratio 1.3d0 :harmful t)
+        (make-traffic :label "Errors 2x" :error-ratio 2d0 :harmful t)
+        (make-traffic :label "Bursty fault, new arm only"
+                      :burst-period 1000 :burst-length 100 :burst-rate 0.1d0
+                      :burst-arms :new :harmful t)))
+
+(defun in-burst-p (traffic route task-id)
+  (and (plusp (traffic-burst-period traffic))
+       (< (mod task-id (traffic-burst-period traffic)) (traffic-burst-length traffic))
+       (or (eq (traffic-burst-arms traffic) :both) (eq route :new))))
+
+(defun failure-probability (traffic route task-id)
+  (let ((base (if (in-burst-p traffic route task-id)
+                  (traffic-burst-rate traffic)
+                  (traffic-error-rate traffic))))
+    (if (eq route :new)
+        (min 1d0 (* base (traffic-error-ratio traffic)))
+        base)))
+
+(defun draw-latency-ms (traffic route rng)
+  "1ms plus an exponential with mean 1ms, scale on the new arm"
+  (let ((base (+ 1d0 (- (log (- 1d0 (orders::rng-uniform rng)))))))
+    (if (eq route :new) (* base (traffic-latency-factor traffic)) base)))
+
+(defun oc-probe-set (min-effect)
+  "A bar set canarying at *OC-FRACTION*. No shims, so no task runs code"
+  (let ((ps (splice::make-patch-set :name 'oc-probe :ramp (list *oc-fraction*)
+                                    :min-effect min-effect
+                                    :runtime-contract-interval 0
+                                    :control-ring (splice::make-control-ring)
+                                    :null-ring (splice::make-control-ring
+                                                :size splice::*null-ring-size*))))
+    (splice::with-set-lock (ps) (splice::enter-stage ps 0))
+    ps))
+
+(defun feed-task (ps traffic task-id rng)
+  "Route TASK-ID by the production draw and report one synthetic outcome"
+  (let ((route (if (< (splice::routing-draw task-id 'oc-probe) *oc-fraction*) :new :old)))
+    (splice::report-outcome ps route
+                            (< (orders::rng-uniform rng)
+                               (failure-probability traffic route task-id))
+                            (draw-latency-ms traffic route rng))))
+
+(defun run-oc-stage (traffic seed &key (min-effect 0.3d0))
+  "Feed one stage until it reaches a decision point. Returns the point and
+the stage's :new observations at it."
+  (let ((ps (oc-probe-set min-effect))
+        (rng (orders:make-rng seed))
+        (point (list :none)))
+    (splice:with-operator-decisions
+      (handler-bind ((splice:operator-decision
+                       (lambda (c)
+                         (setf (car point) (splice:operator-decision-point c))
+                         (splice:freeze-patch c))))
+        (loop for task-id from 1
+              until (not (eq (car point) :none))
+              do (feed-task ps traffic task-id rng))))
+    (values (car point)
+            (splice::canary-stage-observations (splice::patch-set-stage ps)))))
+
+(defun measure-traffic (traffic)
+  "Run *RUNS* stages of TRAFFIC; returns a row plist."
+  (let ((points '()) (detect-ns '()))
+    (dotimes (i *runs*)
+      (multiple-value-bind (point n) (run-oc-stage traffic (+ 5000 (* 131 i)))
+        (push point points)
+        (when (eq point :sprt-reject) (push n detect-ns))))
+    (list :traffic traffic
+          :rejects (count :sprt-reject points)
+          :passes (count :budget-pass points)
+          :timeouts (count :stage-timeout points)
+          :confounded (count :confounded points)
+          :median-n (median detect-ns))))
+
+(defun check-operating-characteristics ()
+  (format t "~%--- C8: operating characteristics at ~a%, ~a runs per shape~%"
+          *oc-fraction* *runs*)
+  (setf *oc-rows* '())
+  (dolist (traffic (oc-traffic-shapes))
+    (push (measure-traffic traffic) *oc-rows*))
+  (dolist (row (reverse *oc-rows*))
+    (let* ((traffic (getf row :traffic))
+           (k (getf row :rejects))
+           (ci (wilson-ci k *runs*)))
+      (cond ((not (traffic-harmful traffic))
+             (check (format nil "C8: ~a false rejects ~a/~a, 95% CI [~,4f, ~,4f] not above alpha"
+                            (traffic-label traffic) k *runs* (first ci) (second ci))
+                    (<= (first ci) 0.01) nil))
+            ((string= "Latency 1.3x" (traffic-label traffic))
+             (check (format nil "C8: latency 1.3x rejected ~a/~a, 95% CI [~,4f, ~,4f] reaches 0.95"
+                            k *runs* (first ci) (second ci))
+                    (>= (second ci) 0.95) nil))))))
+
+(defun write-oc-table (out)
+  (format out "~%## Operating Characteristics (C8, One Stage at ~a%, n=~a Runs Each)~%~%"
+          *oc-fraction* *runs*)
+  (format out "| Traffic | Rejected | Passed | Timed Out | Confounded | Median New-Arm n to Reject |~%|---|---|---|---|---|---|~%")
+  (dolist (row (reverse *oc-rows*))
+    (format out "| ~a | ~a | ~a | ~a | ~a | ~a |~%"
+            (traffic-label (getf row :traffic))
+            (getf row :rejects) (getf row :passes) (getf row :timeouts)
+            (getf row :confounded)
+            (or (getf row :median-n) "N/A"))))
+
+;;; ---------------------------------------------------------------------
 ;;; Report
 
 (defun report-commit ()
@@ -534,6 +666,7 @@ so the check fails without promoting"
                 (or (median (batch-detect-tasks b)) "N/A")
                 (let ((s (remove-duplicates (batch-stages b))))
                   (if s (format nil "~{~a%~^, ~}" (sort s #'<)) "N/A")))))
+    (write-oc-table out)
     (let ((oh (find-if (lambda (e) (and (listp e) (eq (first e) :plain))) *report*)))
       (when oh
         (format out "~%## Overhead (C7)~%~%")
@@ -575,6 +708,7 @@ and the full-log checks run last."
     (check-overhead)
     (splice:close-audit-log)
     (check-audit-log)
+    (check-operating-characteristics)
     (write-report)
     (format t "~%=== ~:[~a FAILURES~;all criteria passed~]; report: artifacts/criteria-report.md ===~%"
             (null *failures*) (length *failures*))
